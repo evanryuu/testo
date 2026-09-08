@@ -1,6 +1,7 @@
+import { parse } from 'yaml';
 import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { RunOptions, RunResult, WorkerCommand, WorkerEvent } from './messages.js';
@@ -13,8 +14,28 @@ export interface RunHandle {
   cancel(): void;
 }
 
+// Add explicit condition-wait windows to the existing two-minute run allowance.
+export function defaultRunTimeout(source: string): number {
+  try {
+    const document = parse(source);
+    const entries = [
+      ...(document?.beforeAll ?? []), ...(document?.beforeEach ?? []),
+      ...(document?.cases ?? []).flatMap((item: any) => item.steps ?? []),
+      ...(document?.afterEach ?? []), ...(document?.afterAll ?? []),
+    ];
+    return 120000 + entries.reduce((total: number, entry: any) => {
+      if (!entry || !Object.hasOwn(entry, 'aiWaitFor')) return total;
+      const value = entry.aiWaitFor?.timeoutMs ?? 60000;
+      return total + (Number.isInteger(value) && value >= 1000 && value <= 300000 ? value : 0);
+    }, 0);
+  } catch { return 120000; } // The worker reports invalid YAML through normal run history.
+}
+
 export function startRun(options: RunOptions, onEvent: (event: WorkerEvent) => void = () => {}, environment: NodeJS.ProcessEnv = process.env): RunHandle {
-  const timeoutMs = options.timeoutMs ?? 120_000;
+  let timeoutMs = options.timeoutMs ?? 120_000;
+  if (options.timeoutMs === undefined) {
+    try { timeoutMs = defaultRunTimeout(readFileSync(options.workflowPath, 'utf8')); } catch { /* The worker reports file read failures. */ }
+  }
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('timeoutMs must be positive');
   if (!/^https?:$/.test(new URL(options.baseUrl).protocol)) throw new Error('baseUrl must use HTTP or HTTPS');
   const workflowPath = path.resolve(options.workflowPath);

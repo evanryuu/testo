@@ -33,7 +33,20 @@ test('Chrome manual login stays outside recording; official Bridge records and r
   writeFileSync(path.join(ext, 'scripts/stop-water-flow.js'), 'void 0;');
   const submitted: string[] = [];
   const submittedSizes: { width: number; height: number }[] = [];
+  let waitCalls = 0, holdWait = false;
   const server = createServer((req, res) => {
+    if (req.url === '/v1/chat/completions') {
+      let body = ''; req.on('data', chunk => body += chunk); req.on('end', () => {
+        const payload = JSON.parse(body); waitCalls++;
+        assert.ok(payload.messages.some((message: any) => Array.isArray(message.content) && message.content.some((part: any) => part.type === 'image_url')));
+        if (holdWait) return;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ id: 'bridge-wait', object: 'chat.completion', created: 1700000000, model: payload.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: `<observation>Bridge page observed</observation><data-json>${JSON.stringify({ StatementIsTruthy: waitCalls >= 2 })}</data-json>` }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } }));
+      }); return;
+    }
+
     if (req.url === '/never.png' || req.url === '/never-document') return;
     if (req.url === '/redirect') { res.writeHead(302, { Location: '/slow-resource' }); res.end(); return; }
     if (req.url?.startsWith('/slow-resource')) { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><input aria-label="ready"><img src="/never.png">'); return; }
@@ -169,7 +182,7 @@ test('Chrome manual login stays outside recording; official Bridge records and r
     } finally { await navigationAgent.destroy(); }
     // Existing Workflow can reconnect after a local binding has been lost.
     await app.close();
-    app = await electron.launch({ args: [root], env: { ...runtimeEnv(), WORKSPACE_DATA_DIR: path.join(dir, 'app'), WORKSPACE_PROJECTS_DIR: path.join(dir, 'projects') } });
+    app = await electron.launch({ args: [root], env: { ...runtimeEnv(), MIDSCENE_MODEL_NAME: 'bridge-wait', MIDSCENE_MODEL_FAMILY: 'gpt-5', MIDSCENE_MODEL_BASE_URL: baseUrl + '/v1', MIDSCENE_MODEL_API_KEY: 'local-bridge-wait-key', MIDSCENE_MODEL_RETRY_COUNT: '0', WORKSPACE_DATA_DIR: path.join(dir, 'app'), WORKSPACE_PROJECTS_DIR: path.join(dir, 'projects') } });
     const reopened = await app.firstWindow(); reopened.setDefaultTimeout(15_000);
     await reopened.getByRole('button', { name: /Chrome 登录会话验证/ }).click();
     await reopened.getByRole('button', { name: /已登录用户发送消息/ }).click();
@@ -180,13 +193,24 @@ test('Chrome manual login stays outside recording; official Bridge records and r
     await reopened.getByRole('button', { name: '登录完成，返回用例运行', exact: true }).click();
     await reopened.getByRole('button', { name: '连接 Chrome', exact: true }).waitFor();
     // Cancel while a real Bridge assertion is waiting; it must preserve Chrome.
-    const saved = await reopened.evaluate(refs => window.workspace.workflow(refs), refs);
-    await reopened.evaluate(async ({ refs, saved }) => window.workspace.saveWorkflow({ ...refs, revision: saved.revision, text: 'cases:\n  - name: Wait\n    steps:\n      - requireViewport: {width: 1100, height: 750}\n      - assertText:\n          text: never present\n          timeoutMs: 30000\n' }), { refs, saved });
+    // The same condition-wait node also uses actual Bridge screenshots and AI transport.
+    let saved = await reopened.evaluate(refs => window.workspace.workflow(refs), refs);
+    await reopened.evaluate(async ({ refs, saved }) => window.workspace.saveWorkflow({ ...refs, revision: saved.revision, text: 'cases:\n  - name: Bridge wait\n    steps:\n      - aiWaitFor: {prompt: The page is ready, timeoutMs: 10000, checkIntervalMs: 200}\n      - assertText: {text: 已登录}\n' }), { refs, saved });
+    const waiting = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), refs);
+    await attach();
+    await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === waiting)?.status, { timeout: 15000 }).toBe('passed');
+    assert.equal(waitCalls, 2);
+    await reopened.screenshot({ path: path.join(dir, 'ai-wait-passed.png') });
+    holdWait = true;
+    saved = await reopened.evaluate(refs => window.workspace.workflow(refs), refs);
+    await reopened.evaluate(async ({ refs, saved }) => window.workspace.saveWorkflow({ ...refs, revision: saved.revision, text: 'cases:\n  - name: Wait\n    steps:\n      - requireViewport: {width: 1100, height: 750}\n      - aiWaitFor:\n          prompt: waiting forever\n          timeoutMs: 30000\n' }), { refs, saved });
     const cancelling = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), refs);
     await attach();
-    await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === cancelling)?.events.some(e => e.type === 'step-started' && e.node === 'assertText')).toBeTruthy();
+    await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === cancelling)?.events.some(e => e.type === 'step-started' && e.node === 'aiWaitFor')).toBeTruthy();
+    await expect.poll(() => waitCalls).toBe(3);
     await reopened.evaluate(() => window.workspace.cancelRun());
     await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === cancelling)?.status).toBe('cancelled');
+    assert.equal(waitCalls, 3);
     assert.equal(target.isClosed(), false);
     assert.equal(await target.evaluate(() => localStorage.getItem('loggedIn')), 'yes');
     await expect.poll(() => target.evaluate(() => ({ width: innerWidth, height: innerHeight }))).toEqual(naturalViewport);

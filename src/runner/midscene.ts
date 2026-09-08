@@ -12,6 +12,7 @@ import { createBridgeNodes } from './bridge-nodes.js';
 import { waitForStableViewport } from '../recording/viewport.js';
 import { captureActionEvidence } from './evidence.js';
 import { describeRunStep } from '../shared/run-steps.js';
+import { createWaitNodes } from './wait-nodes.js';
 import { createRecordedNodes } from './recorded-nodes.js';
 import { RECORDING_VIEWPORT } from '../recording/workflow.js';
 import type { RunOptions, WorkerEvent } from './messages.js';
@@ -75,6 +76,7 @@ export async function executeWorkflow(
       return agent;
     };
     const registry = new NodeRegistry([
+      ...createWaitNodes(ctx => getAgent(ctx.scope === 'case' ? ctx.case.runId : ctx.document.documentRunId)),
       ...createRecordedNodes({ ...(options.chromeTarget ? { prepareViewport: (size, signal) => pinChromeViewport(bridgeAgent!, size, signal) } : { getPage }), onAction: async (ctx, agent, stage) => {
         const step = ctx.scope === 'case' ? ctx.case : ctx.document;
         emit(await captureActionEvidence(agent, options.chromeTarget ? undefined : getPage, artifactDirectory, ctx.input, step.phase, step.stepIndex, stage));
@@ -111,6 +113,7 @@ export async function executeWorkflow(
     // Keep explicit per-step limits; otherwise allow navigation to report its own
     // timeout and finish cleanup before the workflow deadline fires.
     for (const step of [...Object.values(document.lifecycle).flat(), ...document.cases.flatMap(item => item.definition.steps)]) {
+      if (step.node === 'aiWaitFor' && step.meta.timeoutMs === undefined) step.meta.timeoutMs = (typeof step.input.timeoutMs === 'number' ? step.input.timeoutMs : 60000) + 1000;
       if (step.node === 'gotoUrl' && step.meta.timeoutMs === undefined) {
         step.meta.timeoutMs = (typeof step.input.timeoutMs === 'number' ? step.input.timeoutMs : 20000) + 7000;
       }

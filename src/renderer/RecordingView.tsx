@@ -168,16 +168,17 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
       </Card>
     </div> : null}
     {!active && !starting && !preparing && actions.length > 0 ? <Card>
-      <CardHeader className="flex flex-row items-center justify-between gap-3"><CardTitle className="text-base">预期结果</CardTitle><Button type="button" variant="outline" size="sm" onClick={() => { setAssertions([...assertions, { kind: 'text', text: '' }]); setYaml(''); }}><Plus className="size-3.5" />添加断言</Button></CardHeader>
+      <CardHeader className="flex flex-row items-center justify-between gap-3"><CardTitle className="text-base">等待条件与预期结果</CardTitle><div className="flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" onClick={() => { setAssertions([...assertions, { kind: 'wait', text: '', timeoutMs: 60000 }]); setYaml(''); }}><Plus className="size-3.5" />添加等待条件</Button><Button type="button" variant="outline" size="sm" onClick={() => { setAssertions([...assertions, { kind: 'text', text: '' }]); setYaml(''); }}><Plus className="size-3.5" />添加断言</Button></div></CardHeader>
       <CardContent className="space-y-3">
         {assertions.length ? assertions.map((assertion, index) => <div className="flex flex-wrap items-center gap-3" key={index}>
-          <NativeSelect aria-label={`断言 ${index + 1} 类型`} value={assertion.kind} onChange={(e) => { setAssertions(assertions.map((a, n) => n === index ? { ...a, kind: e.target.value as 'text' | 'ai' } : a)); setYaml(''); }}>
-            <NativeSelectOption value="text">页面包含可见文本</NativeSelectOption><NativeSelectOption value="ai">AI 判断预期结果</NativeSelectOption>
+          <NativeSelect aria-label={`断言 ${index + 1} 类型`} value={assertion.kind} onChange={(e) => { setAssertions(assertions.map((a, n) => n === index ? { ...a, kind: e.target.value as RecordingAssertion['kind'] } : a)); setYaml(''); }}>
+            <NativeSelectOption value="wait">等待页面满足条件</NativeSelectOption><NativeSelectOption value="text">页面包含可见文本</NativeSelectOption><NativeSelectOption value="ai">AI 判断预期结果</NativeSelectOption>
           </NativeSelect>
-          <Input className="min-w-48 flex-1" aria-label={`断言 ${index + 1} 内容`} placeholder={assertion.kind === 'text' ? '例如：发送成功' : '例如：页面展示了回答，并提示用户登录'} value={assertion.text} onChange={(e) => { setAssertions(assertions.map((a, n) => n === index ? { ...a, text: e.target.value } : a)); setYaml(''); }} />
+          <Input className="min-w-48 flex-1" aria-label={`断言 ${index + 1} 内容`} placeholder={assertion.kind === 'wait' ? '例如：最新发送的消息下方出现非空的 AI 回复' : assertion.kind === 'text' ? '例如：发送成功' : '例如：页面展示了回答，并提示用户登录'} value={assertion.text} onChange={(e) => { setAssertions(assertions.map((a, n) => n === index ? { ...a, text: e.target.value } : a)); setYaml(''); }} />
+          {assertion.kind === 'wait' ? <label className="flex items-center gap-2 text-sm text-muted-foreground">最多等待<Input className="w-24" type="number" min={1} max={300} step={1} aria-label={`等待条件 ${index + 1} 最长等待秒数`} value={(assertion.timeoutMs ?? 60000) / 1000} onChange={(e) => { setAssertions(assertions.map((a, n) => n === index ? { ...a, timeoutMs: Number(e.target.value) * 1000 } : a)); setYaml(''); }} />秒</label> : null}
           <Button type="button" variant="ghost" size="icon" aria-label={`移除断言 ${index + 1}`} onClick={() => { setAssertions(assertions.filter((_, n) => n !== index)); setYaml(''); }}><X className="size-4" /></Button>
-        </div>) : <p className="text-sm leading-6 text-muted-foreground">添加断言后，测试才能检查业务结果。没有断言时，仅验证操作是否完成。</p>}
-        <p className="pt-2 text-xs leading-6 text-muted-foreground">按录制操作回放不调用模型，页面布局变化后可能需要重录。AI 步骤和 AI 断言使用 Model Settings 中的配置。</p>
+        </div>) : <p className="text-sm leading-6 text-muted-foreground">异步结果可以先添加等待条件，再添加断言检查业务结果。没有等待条件或断言时，仅验证操作是否完成。</p>}
+        <p className="pt-2 text-xs leading-6 text-muted-foreground">等待条件和断言按上方顺序执行。等待条件满足后立即继续，超过时限才失败；AI 断言只检查当时的页面。AI 步骤、等待条件和 AI 断言使用 Model Settings 中的配置。</p>
       </CardContent>
     </Card> : null}
     <EventDetails event={selectedEvent} recordingId={draft.id} close={() => setSelectedEvent(undefined)} />

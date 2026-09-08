@@ -15,7 +15,7 @@ export interface RecorderEvent {
   value?: string;
 }
 export interface RecordingStepChoice { hashId: string; mode: 'recorded' | 'ai' | 'skip'; prompt?: string; confirmedPrompt?: string }
-export interface RecordingAssertion { kind: 'text' | 'ai'; text: string }
+export interface RecordingAssertion { kind: 'text' | 'ai' | 'wait'; text: string; timeoutMs?: number }
 
 const point = { x: z.number().finite().min(0).max(16383).optional(), y: z.number().finite().min(0).max(16383).optional() };
 export const recordedActionSchema = z.object({
@@ -93,9 +93,14 @@ export function buildRecordedWorkflow(input: {
   steps.unshift({ gotoUrl: { url: input.startUrl ?? '${baseUrl}' } });
   if (needsViewport) steps.unshift(input.viewport ? { requireViewport: viewport } : { setViewportSize: viewport });
   for (const assertion of input.assertions ?? []) {
-    if (!assertion.text.trim()) throw new Error('断言内容不能为空');
+    if (!assertion.text.trim()) throw new Error(assertion.kind === 'wait' ? '等待条件不能为空' : '断言内容不能为空');
     if (assertion.kind === 'text') steps.push({ assertText: { text: assertion.text.trim() } });
     else if (assertion.kind === 'ai') steps.push({ aiAssert: assertion.text.trim() });
+    else if (assertion.kind === 'wait') {
+      const timeoutMs = assertion.timeoutMs ?? 60000;
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 300000) throw new Error('最长等待时间必须在 1 到 300 秒之间');
+      steps.push({ aiWaitFor: { prompt: assertion.text.trim(), timeoutMs } });
+    }
     else throw new Error('不支持的断言类型');
   }
   return stringify({ cases: [{ name: input.name.trim(), steps }], afterEach: [{ recordToReport: '录制回放结束时的页面' }] });

@@ -147,3 +147,36 @@ test('isolated replay restores a Chrome recording viewport before coordinate act
     assert.equal(result.status, 'passed', JSON.stringify(result));
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
+
+test('wait conditions keep their order and generate explicit bounded waits without changing assertions', () => {
+  const steps = parse(buildRecordedWorkflow({
+    name: 'Wait for the current answer',
+    events: [event('Tap', { x: 22, y: 31 })],
+    assertions: [
+      { kind: 'wait', text: '  最新消息下方出现回答  ' },
+      { kind: 'wait', text: '生成结束', timeoutMs: 120000 },
+      { kind: 'ai', text: '回答与问题相关' },
+      { kind: 'text', text: '完成' },
+    ],
+  })).cases[0].steps;
+  assert.deepEqual(steps.slice(-4), [
+    { aiWaitFor: { prompt: '最新消息下方出现回答', timeoutMs: 60000 } },
+    { aiWaitFor: { prompt: '生成结束', timeoutMs: 120000 } },
+    { aiAssert: '回答与问题相关' },
+    { assertText: { text: '完成' } },
+  ]);
+});
+
+test('wait conditions reject blank prompts and invalid time limits', () => {
+  const build = (text: string, timeoutMs?: number) => buildRecordedWorkflow({
+    name: 'Wait', events: [event('Tap', { x: 22, y: 31 })],
+    assertions: [{ kind: 'wait', text, timeoutMs }],
+  });
+  assert.throws(() => build('  '), /等待条件不能为空/);
+  for (const timeoutMs of [0, -1000, 999, 300001, 1000.5, Number.NaN, Infinity]) {
+    assert.throws(() => build('回答出现', timeoutMs), /最长等待时间/);
+  }
+  for (const timeoutMs of [1000, 300000]) {
+    assert.equal(parse(build('回答出现', timeoutMs)).cases[0].steps.at(-1).aiWaitFor.timeoutMs, timeoutMs);
+  }
+});

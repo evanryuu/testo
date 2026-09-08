@@ -11,6 +11,7 @@ import { WorkspaceStore } from './workspace.js';
 import { RecordingService } from './recording.js';
 import type { ChromeTarget } from '../recording/chrome-bridge.js';
 import { buildRecordedWorkflow } from '../recording/workflow.js';
+import { createWaitNodes } from '../runner/wait-nodes.js';
 import { createRecordedNodes } from '../runner/recorded-nodes.js';
 import { parse } from 'yaml';
 import { runPlanFromYaml } from '../shared/run-steps.js';
@@ -60,6 +61,7 @@ function validateWorkflow(text: string): void {
     const registry = new NodeRegistry([
       ...createPlaywrightNodes({ getPage: unavailable }),
       ...createRecordedNodes({ getPage: unavailable, getAgent: unavailable }),
+      ...createWaitNodes(unavailable),
       ...createMidsceneNodes({ agentClass: PlaywrightAgent, getAgent: unavailable }),
     ]);
     const document = collectWorkflowDocument({ projectId: 'validation', sourcePath: draft, absolutePath: draft }, {
