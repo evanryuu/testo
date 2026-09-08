@@ -1,0 +1,11 @@
+node_modules/
+dist/
+artifacts/
+.env
+.env.*
+dist-ui/
+.desktop-data/
+projects/
+dist-preview/
+midscene_run/
+.DS_Store
