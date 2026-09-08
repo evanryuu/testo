@@ -41,6 +41,26 @@ npm run desktop
 
 默认的独立会话不会沿用用户已打开的 Chrome 登录状态；选择 Chrome 现有会话可复用手动登录。批量运行按队列顺序执行，同一时间只控制一个用例。默认运行时限为 120 秒加用例中的条件等待时限；显式设置的运行时限仍优先。
 
+## Group 与关系图
+
+在侧栏 **Groups** 中新建可复用分组，按名称、标签或 Suite 搜索用例，添加成员并调整顺序。同一用例可以加入多个 Group；Suite 继续用于业务分类，Group 用于组合运行。
+
+勾选一个或多个 Group，调整组的运行顺序，再点击运行。选择环境和已确认的 Chrome 登录窗口后，所有成员按组顺序、组内顺序依次执行；重复用例只在首次出现时运行一次。空组、缺失用例或未保存 Web Workflow 会阻止整批启动，修复后再运行。批次历史保存当时的组名、成员顺序和每例结果，后续修改 Group 不改变旧记录。
+
+切换到关系图可以查看 Project → Group → Case，展开成员、点击用例查看详情、选择分组运行，并平移、缩放或适应画布。图形使用 [React Flow](https://reactflow.dev/)，节点沿用 shadcn/ui + Tailwind。连线表示归属关系；执行顺序在 Group 编辑器与运行预览中维护。列表和编辑器每页 50 条，画布每页最多 8 个组、展开组的 12 个成员，避免一次渲染全部用例。
+
+Group 保存于项目的 `groups/<id>.yaml`，可以随 Git 管理；删除 Group 只删除分组定义，保留用例和运行历史：
+
+```yaml
+schemaVersion: 1
+id: smoke
+name: 冒烟测试
+description: 发布前检查主要功能
+caseIds:
+  - login
+  - send-message
+```
+
 ## 模型配置
 
 Model Settings 对应 Midscene 的 `MIDSCENE_MODEL_NAME`、`MIDSCENE_MODEL_BASE_URL`、`MIDSCENE_MODEL_FAMILY` 和 `MIDSCENE_MODEL_API_KEY`，不绑定服务商。API Key 使用 Electron safeStorage 系统加密后保存在本机，不返回界面明文；留空保留已保存的 Key。

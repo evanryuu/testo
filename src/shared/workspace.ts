@@ -3,6 +3,9 @@ import type { RecordingStepChoice, RecordingAssertion, RecordingReviewStep } fro
 import type { RunResult, WorkerEvent } from '../runner/messages.js';
 
 export interface Suite { id: string; name: string; directory: string }
+export interface TestGroup { id: string; name: string; description: string; caseIds: string[]; revision: string }
+export interface SaveGroupInput { projectId: string; id?: string; revision?: string; name: string; description: string; caseIds: string[] }
+export interface GroupBatchInput { projectId: string; environmentId: string; failurePolicy: 'stop' | 'continue'; sessionId: string; groupIds: string[] }
 export interface Environment { id: string; name: string; web: { baseUrl: string } }
 export interface Workflow { id: string; platform: 'web' | 'android' | 'ios'; definitionPath: string; ready: boolean }
 export interface TestCase {
@@ -11,7 +14,7 @@ export interface TestCase {
 }
 export interface Project {
   id: string; name: string; description: string; root: string;
-  suites: Suite[]; cases: TestCase[]; environments: Environment[]; errors: string[];
+  groups?: TestGroup[]; suites: Suite[]; cases: TestCase[]; environments: Environment[]; errors: string[];
 }
 export interface HistoryRun {
   runId: string; projectId: string; caseId: string; caseName: string; environment: string;
@@ -28,8 +31,9 @@ export interface BatchInput {
 }
 export interface BatchRun {
   id: string; projectId: string; environment: string; startedAt: string; finishedAt?: string;
+  groups?: { id: string; name: string }[];
   failurePolicy: 'stop' | 'continue'; status: 'running' | 'passed' | 'failed' | 'cancelled' | 'interrupted';
-  items: { caseId: string; caseName: string; workflowId: string; sessionName: string;
+  items: { caseId: string; caseName: string; workflowId: string; sessionName: string; groupNames?: string[];
     status: 'queued' | 'running' | 'skipped' | 'interrupted' | RunResult['status']; runId?: string; error?: string }[];
 }
 export interface ModelSettings { name: string; baseUrl: string; family: string; hasApiKey: boolean }
@@ -38,6 +42,9 @@ export interface DesktopApi {
   state(): Promise<WorkspaceState>;
   createProject(input: { name: string; description: string }): Promise<string>;
   openProject(): Promise<string | null>;
+  saveGroup(input: SaveGroupInput): Promise<string>;
+  deleteGroup(input: { projectId: string; id: string; revision: string }): Promise<void>;
+  runGroups(input: GroupBatchInput): Promise<string>;
   createSuite(input: { projectId: string; name: string }): Promise<string>;
   createCase(input: { projectId: string; name: string; suiteId: string; platforms: string[] }): Promise<string>;
   saveCase(input: { projectId: string; caseId: string; revision: string; name: string; description: string; priority: string; tags: string[] }): Promise<void>;

@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parse, stringify } from 'yaml';
-import type { Environment, Project, Suite, TestCase, Workflow } from '../shared/workspace.js';
+import type { Environment, Project, SaveGroupInput, Suite, TestCase, TestGroup, Workflow } from '../shared/workspace.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const required = (value: unknown, label: string): string => {
@@ -35,6 +35,7 @@ function readYaml(file: string): any {
 
 export class WorkspaceStore {
   private roots: string[];
+  private workflowIndexes = new WeakMap<Project, Map<string, { file: string; platform: string; caseFile: string; caseRevision: string }>>();
   constructor(private dataDir: string, private projectsDir: string) {
     mkdirSync(dataDir, { recursive: true });
     const recent = path.join(dataDir, 'projects.json');
@@ -79,6 +80,8 @@ export class WorkspaceStore {
     const suites: Suite[] = config.suites.map((s: any) => ({ id: required(s.id, 'Suite ID'), name: required(s.name, 'Suite 名称'), directory: required(s.directory, 'Suite 目录') }));
     if (new Set(suites.map((s) => s.id)).size !== suites.length || new Set(suites.map((s) => s.directory)).size !== suites.length) throw new Error('Suite ID 或目录重复');
     const cases: TestCase[] = [], environments: Environment[] = [], errors: string[] = [];
+    const caseIds = new Set<string>();
+    const workflowIndex = new Map<string, { file: string; platform: string; caseFile: string; caseRevision: string }>();
     for (const suite of suites) {
       const directory = fileIn(root, suite.directory);
       if (!existsSync(directory)) continue;
@@ -89,7 +92,7 @@ export class WorkspaceStore {
           const text = readFileSync(caseFile, 'utf8'), item = readYaml(caseFile);
           if (item.schemaVersion !== 1 || item.suiteId !== suite.id) throw new Error('Case 版本或 Suite 关联错误');
           const id = required(item.id, 'Case ID');
-          if (cases.some((c) => c.id === id)) throw new Error('Case ID 重复');
+          if (caseIds.has(id)) throw new Error('Case ID 重复');
           const workflows: Workflow[] = (item.workflows ?? []).map((w: any) => {
             if (!['web', 'android', 'ios'].includes(w.platform)) throw new Error('不支持的平台');
             const definitionPath = required(w.definitionPath, 'Workflow 路径');
@@ -99,6 +102,8 @@ export class WorkspaceStore {
           if (new Set(workflows.map((w) => w.id)).size !== workflows.length || new Set(workflows.map((w) => w.platform)).size !== workflows.length) throw new Error('Workflow ID 或平台重复');
           if (!Array.isArray(item.tags) || !item.tags.every((t: unknown) => typeof t === 'string')) throw new Error('Tags 格式错误');
           cases.push({ id, name: required(item.name, 'Case 名称'), description: item.description ?? '', suiteId: suite.id, priority: item.priority ?? 'P1', tags: item.tags, workflows, revision: hash(text) });
+          caseIds.add(id);
+          for (const workflow of workflows) workflowIndex.set(JSON.stringify([id, workflow.id]), { file: fileIn(root, path.join(suite.directory, entry.name, workflow.definitionPath)), platform: workflow.platform, caseFile, caseRevision: hash(text) });
         } catch (error) { errors.push(`${suite.name}/${entry.name}: ${String(error)}`); }
       }
     }
@@ -111,7 +116,64 @@ export class WorkspaceStore {
         environments.push({ id, name: required(e.name, '环境名称'), web: { baseUrl: required(e.web?.baseUrl, '环境地址') } });
       } catch (error) { errors.push(`${name}: ${String(error)}`); }
     }
-    return { id: required(config.project?.id, 'Project ID'), name: required(config.project?.name, '项目名称'), description: config.project.description ?? '', root, suites, cases, environments, errors };
+    const groups: TestGroup[] = [];
+    try {
+      const directory = fileIn(root, 'groups');
+      if (existsSync(directory)) for (const name of readdirSync(directory).filter(name => name.endsWith('.yaml'))) {
+        try {
+          const file = fileIn(root, `groups/${name}`), text = readFileSync(file, 'utf8'), value = readYaml(file);
+          const id = this.groupId(value.id);
+          if (value.schemaVersion !== 1 || name !== `${id}.yaml`) throw new Error('Group 版本或文件名与 ID 不匹配');
+          if (typeof value.description !== 'string') throw new Error('Group 描述必须是文本');
+          const references = this.groupCaseIds(value.caseIds);
+          groups.push({ id, name: required(value.name, 'Group 名称'), description: value.description, caseIds: references, revision: hash(text) });
+          const missing = references.filter(id => !caseIds.has(id));
+          if (missing.length) errors.push(`${name}: Group 引用了 ${missing.length} 个不存在的用例，请编辑修复`);
+        } catch (error) { errors.push(`groups/${name}: ${String(error)}`); }
+      }
+    } catch (error) { errors.push(`groups: ${String(error)}`); }
+    const project: Project = { id: required(config.project?.id, 'Project ID'), name: required(config.project?.name, '项目名称'), description: config.project.description ?? '', root, suites, cases, environments, groups, errors };
+    this.workflowIndexes.set(project, workflowIndex);
+    return project;
+  }
+  private groupId(value: unknown): string {
+    const id = required(value, 'Group ID');
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(id)) throw new Error('Group ID 格式错误');
+    return id;
+  }
+  private groupCaseIds(value: unknown): string[] {
+    if (!Array.isArray(value) || value.some(id => typeof id !== 'string' || !id.trim())) throw new Error('Group 用例引用格式错误');
+    if (new Set(value).size !== value.length) throw new Error('Group 用例引用重复');
+    return [...value];
+  }
+  saveGroup(input: SaveGroupInput): string {
+    const project = this.project(input.projectId);
+    const id = input.id === undefined ? randomUUID() : this.groupId(input.id);
+    const file = fileIn(project.root, `groups/${id}.yaml`);
+    if (input.id !== undefined) {
+      if (!existsSync(file)) throw new Error('Group 不存在');
+      if (hash(readFileSync(file, 'utf8')) !== input.revision) throw new Error('Group 已被外部修改，请重新加载后再保存');
+    }
+    const caseIds = this.groupCaseIds(input.caseIds);
+    const available = new Set(project.cases.map(item => item.id));
+    if (caseIds.some(caseId => !available.has(caseId))) throw new Error('Group 引用了不存在的用例，请重新选择');
+    if (typeof input.description !== 'string') throw new Error('Group 描述必须是文本');
+    writeAtomic(file, { schemaVersion: 1, id, name: required(input.name, 'Group 名称'), description: input.description, caseIds });
+    return id;
+  }
+  deleteGroup(projectId: string, id: string, revision: string): void {
+    const project = this.project(projectId);
+    const file = fileIn(project.root, `groups/${this.groupId(id)}.yaml`);
+    if (!existsSync(file)) throw new Error('Group 不存在');
+    if (hash(readFileSync(file, 'utf8')) !== revision) throw new Error('Group 已被外部修改，请重新加载后再删除');
+    unlinkSync(file);
+  }
+  workflowLocationFromProject(project: Project, caseId: string, workflowId: string): { file: string; platform: string } {
+    const location = this.workflowIndexes.get(project)?.get(JSON.stringify([caseId, workflowId]));
+    if (!location) throw new Error('Workflow 不存在或项目快照已失效，请重新加载');
+    const caseFile = fileIn(project.root, path.relative(project.root, location.caseFile));
+    if (!existsSync(caseFile) || hash(readFileSync(caseFile, 'utf8')) !== location.caseRevision) throw new Error('排队期间用例定义已修改，请重新加载后再运行');
+    return { file: fileIn(project.root, path.relative(project.root, location.file)), platform: location.platform };
   }
   createSuite(projectId: string, name: string): string {
     const p = this.project(projectId), file = fileIn(p.root, 'workspace.yaml'), config = readYaml(file);

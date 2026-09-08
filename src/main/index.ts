@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, realpathSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { collectWorkflowDocument, NodeRegistry } from '@midscene/test';
 import { createMidsceneNodes } from '@midscene/test/midscene';
 import { createPlaywrightNodes } from '@midscene/test/playwright';
@@ -15,10 +15,11 @@ import { createWaitNodes } from '../runner/wait-nodes.js';
 import { createRecordedNodes } from '../runner/recorded-nodes.js';
 import { parse } from 'yaml';
 import { runPlanFromYaml } from '../shared/run-steps.js';
+import { expandGroups } from './group-plan.js';
 import { BatchQueue } from './batch.js';
 import { HistoryStore } from './history.js';
 import { startRun, type RunHandle } from '../runner/run.js';
-import type { HistoryRun, ModelSettings, BrowserSession, BatchInput } from '../shared/workspace.js';
+import type { HistoryRun, ModelSettings, BrowserSession, BatchInput, GroupBatchInput, Project } from '../shared/workspace.js';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 const dataDir = path.resolve(process.env.WORKSPACE_DATA_DIR || path.join(root, '.desktop-data'));
@@ -78,19 +79,22 @@ function validateWorkflow(text: string): void {
   } finally { if (existsSync(draft)) unlinkSync(draft); }
 }
 
-function prepareRun(i: { projectId: string; caseId: string; workflowId: string; environmentId: string }) {
-  const { project, item } = store.caseLocation(i.projectId, i.caseId);
-  const { file, platform } = store.workflowLocation(i.projectId, i.caseId, i.workflowId);
+const workflowHash = (text: string) => createHash('sha256').update(text).digest('hex');
+function prepareRun(i: { projectId: string; caseId: string; workflowId: string; environmentId: string }, project = store.project(i.projectId)) {
+  const item = project.cases.find(item => item.id === i.caseId);
+  if (!item) throw new Error('用例不存在或无法读取');
+  const { file, platform } = store.workflowLocationFromProject(project, i.caseId, i.workflowId);
   if (platform !== 'web') throw new Error('当前版本只支持执行 Web Workflow');
   const environment = project.environments.find(e => e.id === i.environmentId);
   if (!environment) throw new Error('请选择运行环境');
   if (!existsSync(file)) throw new Error(`${item.name} 尚未保存 Workflow`);
-  const workflow = store.workflow(i.projectId, i.caseId, i.workflowId);
-  validateWorkflow(workflow.text);
-  return { project, item, file, environment, revision: workflow.revision, input: i };
+  const text = readFileSync(file, 'utf8');
+  validateWorkflow(text);
+  return { project, item, file, environment, revision: workflowHash(text), input: i };
 }
 function launchRun(plan: ReturnType<typeof prepareRun>, chromeTarget?: ChromeTarget, batchId?: string, sessionName?: string): RunHandle {
-  if (store.workflow(plan.input.projectId, plan.input.caseId, plan.input.workflowId).revision !== plan.revision) {
+  const current = store.workflowLocationFromProject(plan.project, plan.input.caseId, plan.input.workflowId);
+  if (current.file !== plan.file || workflowHash(readFileSync(current.file, 'utf8')) !== plan.revision) {
     throw new Error('排队期间 Workflow 已修改，请重新发起批次');
   }
   const { project, item, file, environment } = plan;
@@ -109,6 +113,26 @@ function launchRun(plan: ReturnType<typeof prepareRun>, chromeTarget?: ChromeTar
   return run;
 }
 
+async function startBatch(i: BatchInput, project: Project, groupPlan?: ReturnType<typeof expandGroups>): Promise<string> {
+  if (occupied() || recorder.active) throw new Error('请先结束运行、录制或窗口连接');
+  if (!Array.isArray(i.items) || !i.items.length || i.items.length > 10000) throw new Error('请选择 1 至 10000 个用例');
+  if (i.failurePolicy !== 'stop' && i.failurePolicy !== 'continue') throw new Error('请选择失败处理方式');
+  const plans = i.items.map(item => {
+    const plan = prepareRun({ ...item, projectId: i.projectId, environmentId: i.environmentId }, project);
+    const session = sessions.get(item.sessionId);
+    if (!session || session.info.projectId !== i.projectId || session.info.environmentId !== i.environmentId || session.target.origin !== new URL(plan.environment.web.baseUrl).origin) throw new Error(`请为 ${plan.item.name} 选择此环境已确认的登录窗口`);
+    return { plan, session: { info: { ...session.info }, target: { ...session.target } } };
+  });
+  preparing = true;
+  try {
+    await recorder.release();
+    if (quitting) throw new Error('应用正在退出');
+    return batchQueue.start({ projectId: i.projectId, environment: plans[0]!.plan.environment.name, failurePolicy: i.failurePolicy, ...(groupPlan ? { groups: groupPlan.groups } : {}),
+      items: plans.map(({ plan, session }) => ({ caseId: plan.item.id, caseName: plan.item.name, workflowId: plan.input.workflowId, sessionName: session.info.name, ...(groupPlan ? { groupNames: groupPlan.groupNames.get(plan.item.id) } : {}), status: 'queued' })) },
+      (index, batchId) => { const { plan, session } = plans[index]!; return launchRun(plan, session.target, batchId, session.info.name); });
+  } finally { preparing = false; }
+}
+
 const handlers: Record<string, (input: any) => unknown> = {
   state: () => ({ ...store.list(), runs: history.list(), activeRunId: active?.runId, batches: history.batches(), sessions: [...sessions.values()].map(s => s.info), activeBatchId: batchQueue.active?.id, connectingSession, recording: recorder.draft, model: modelSettings() }),
   createProject: (i) => store.create(i.name, i.description ?? ''),
@@ -116,6 +140,8 @@ const handlers: Record<string, (input: any) => unknown> = {
     const result = await dialog.showOpenDialog(mainWindow, { title: '打开包含 workspace.yaml 的项目文件夹', properties: ['openDirectory'] });
     return result.canceled ? null : store.open(result.filePaths[0]!);
   },
+  saveGroup: (i) => store.saveGroup(i),
+  deleteGroup: (i) => store.deleteGroup(i.projectId, i.id, i.revision),
   createSuite: (i) => store.createSuite(i.projectId, i.name),
   createCase: (i) => store.createCase(i.projectId, i.name, i.suiteId, i.platforms),
   saveCase: (i) => store.saveCase(i),
@@ -165,24 +191,14 @@ const handlers: Record<string, (input: any) => unknown> = {
       return id;
     } finally { preparing = false; connectingSession = false; connectionResult = undefined; change(); }
   },
-  runBatch: async (i: BatchInput) => {
+  runBatch: (i: BatchInput) => startBatch(i, store.project(i.projectId)),
+  runGroups: (i: GroupBatchInput) => {
     if (occupied() || recorder.active) throw new Error('请先结束运行、录制或窗口连接');
-    if (!Array.isArray(i.items) || !i.items.length || i.items.length > 100) throw new Error('请选择 1 至 100 个用例');
-    if (i.failurePolicy !== 'stop' && i.failurePolicy !== 'continue') throw new Error('请选择失败处理方式');
-    const plans = i.items.map(item => {
-      const plan = prepareRun({ ...item, projectId: i.projectId, environmentId: i.environmentId });
-      const session = sessions.get(item.sessionId);
-      if (!session || session.info.projectId !== i.projectId || session.info.environmentId !== i.environmentId || session.target.origin !== new URL(plan.environment.web.baseUrl).origin) throw new Error(`请为 ${plan.item.name} 选择此环境已确认的登录窗口`);
-      return { plan, session: { info: { ...session.info }, target: { ...session.target } } };
-    });
-    preparing = true;
-    try {
-      await recorder.release();
-      if (quitting) throw new Error('应用正在退出');
-      return batchQueue.start({ projectId: i.projectId, environment: plans[0]!.plan.environment.name, failurePolicy: i.failurePolicy,
-        items: plans.map(({ plan, session }) => ({ caseId: plan.item.id, caseName: plan.item.name, workflowId: plan.input.workflowId, sessionName: session.info.name, status: 'queued' })) },
-        (index, batchId) => { const { plan, session } = plans[index]!; return launchRun(plan, session.target, batchId, session.info.name); });
-    } finally { preparing = false; }
+    const project = store.project(i.projectId);
+    const groupPlan = expandGroups(project, i.groupIds);
+    const cases = new Map(project.cases.map(item => [item.id, item]));
+    return startBatch({ projectId: i.projectId, environmentId: i.environmentId, failurePolicy: i.failurePolicy,
+      items: groupPlan.caseIds.map(caseId => ({ caseId, workflowId: cases.get(caseId)!.workflows.find(workflow => workflow.platform === 'web')!.id, sessionId: i.sessionId })) }, project, groupPlan);
   },
   cancelBatch: (i) => batchQueue.cancel(i.id),
   startRecording: async (i) => {

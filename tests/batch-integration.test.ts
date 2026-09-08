@@ -48,15 +48,15 @@ window.startAutoBridge = (url) => {
   mkdirSync(path.join(ext, 'scripts'));
   await build({ ...bundle, entryPoints: ['node_modules/@midscene/shared/dist/es/extractor/index.mjs'], globalName: 'midscene_element_inspector', outfile: path.join(ext, 'scripts/htmlElement.js') });
   writeFileSync(path.join(ext, 'scripts/stop-water-flow.js'), 'void 0;');
-  const hits: { action: string; who: string; cookie: string }[] = [];
+  const hits: { action: string; who: string; cookie: string; clickId: string; method: string }[] = [];
   const server = createServer((request, response) => {
     const url = new URL(request.url!, 'http://local.test');
     if (url.pathname === '/hit') {
-      hits.push({ action: url.searchParams.get('action')!, who: url.searchParams.get('who')!, cookie: request.headers.cookie ?? '' });
+      hits.push({ action: url.searchParams.get('action')!, who: url.searchParams.get('who')!, cookie: request.headers.cookie ?? '', clickId: url.searchParams.get('click')!, method: request.method! });
       response.end('ok'); return;
     }
     response.setHeader('Content-Type', 'text/html');
-    response.end(`<!doctype html><button style="position:absolute;left:20px;top:20px;width:120px;height:50px" onclick="send('A')">Action A</button><button style="position:absolute;left:200px;top:20px;width:120px;height:50px" onclick="send('B')">Action B</button><p id="result" style="position:absolute;top:100px">Ready</p><script>function send(action){document.querySelector('#result').textContent='Sent '+action;fetch('/hit?action='+action+'&who='+sessionStorage.getItem('who'))}</script>`);
+    response.end(`<!doctype html><button style="position:absolute;left:20px;top:20px;width:120px;height:50px" onclick="send('A')">Action A</button><button style="position:absolute;left:200px;top:20px;width:120px;height:50px" onclick="send('B')">Action B</button><p id="result" style="position:absolute;top:100px">Ready</p><script>function send(action){const click=Number(sessionStorage.getItem('clicks')||0)+1;sessionStorage.setItem('clicks',String(click));document.querySelector('#result').textContent='Sent '+action;fetch('/hit?action='+action+'&who='+sessionStorage.getItem('who')+'&click='+click,{method:'POST'})}</script>`);
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert.ok(address && typeof address !== 'string');
@@ -118,10 +118,38 @@ window.startAutoBridge = (url) => {
     const targets = await extensionPage.evaluate(async () => (await (globalThis as any).chrome.tabs.query({})).filter((tab: any) => /\/(first|second)$/.test(tab.url)).map((tab: any) => ({ url: tab.url, windowId: tab.windowId })));
     assert.equal(new Set(targets.map((target: any) => target.windowId)).size, 2);
 
+    const groupIds = await ui.evaluate(async ({ projectId, cases }) => [
+      await window.workspace.saveGroup({ projectId, name: 'Group A', description: 'First action', caseIds: [cases[0]!.caseId] }),
+      await window.workspace.saveGroup({ projectId, name: 'Group B', description: 'Both actions', caseIds: [cases[0]!.caseId, cases[1]!.caseId] }),
+    ], refs);
+    const invalidGroups = await ui.evaluate(async ({ refs, sessionId }) => {
+      const before = await window.workspace.state();
+      const project = before.projects.find(p => p.id === refs.projectId)!;
+      const empty = await window.workspace.saveGroup({ projectId: refs.projectId, name: 'Empty group', description: '', caseIds: [] });
+      const noWorkflow = await window.workspace.createCase({ projectId: refs.projectId, name: 'Unrecorded case', suiteId: project.suites[0]!.id, platforms: ['web'] });
+      const unready = await window.workspace.saveGroup({ projectId: refs.projectId, name: 'Unready group', description: '', caseIds: [noWorkflow] });
+      const errors: string[] = [];
+      for (const groupIds of [[], ['missing-group'], [empty], [unready]]) {
+        try { await window.workspace.runGroups({ projectId: refs.projectId, environmentId: refs.environmentId, failurePolicy: 'stop', sessionId, groupIds }); errors.push(''); }
+        catch (error) { errors.push(String(error)); }
+      }
+      try { await window.workspace.saveGroup({ projectId: refs.projectId, name: 'Missing case group', description: '', caseIds: ['missing-case'] }); errors.push(''); }
+      catch (error) { errors.push(String(error)); }
+      const after = await window.workspace.state();
+      return { errors, beforeBatches: before.batches!.length, afterBatches: after.batches!.length, beforeRuns: before.runs.length, afterRuns: after.runs.length, activeBatchId: after.activeBatchId };
+    }, { refs, sessionId: firstSession });
+    assert.equal(invalidGroups.errors.length, 5);
+    assert.ok(invalidGroups.errors.every(Boolean), 'empty, missing and unrecorded group references are rejected');
+    assert.equal(invalidGroups.afterBatches, invalidGroups.beforeBatches, 'invalid groups cannot create an empty batch');
+    assert.equal(invalidGroups.afterRuns, invalidGroups.beforeRuns);
+    assert.equal(invalidGroups.activeBatchId, undefined);
+
     const completed: BatchRun[] = [];
-    const runBatch = async (caseIndexes: number[], sessionIds: string[], failurePolicy: BatchInput['failurePolicy'], cancel = false) => {
+    const runBatch = async (caseIndexes: number[], sessionIds: string[], failurePolicy: BatchInput['failurePolicy'], cancel = false, groupIds?: string[]) => {
       const input = { projectId: refs.projectId, environmentId: refs.environmentId, failurePolicy, items: caseIndexes.map((index, position) => ({ ...refs.cases[index]!, sessionId: sessionIds[position]! })) };
-      const id = await ui!.evaluate(input => window.workspace.runBatch(input), input);
+      const id = groupIds
+        ? await ui!.evaluate(input => window.workspace.runGroups(input), { projectId: refs.projectId, environmentId: refs.environmentId, failurePolicy, sessionId: sessionIds[0]!, groupIds })
+        : await ui!.evaluate(input => window.workspace.runBatch(input), input);
       if (!completed.length) {
         const rejected = await ui!.evaluate(async ref => Promise.all([
           window.workspace.startRecording({ ...ref, browserMode: 'bridge' }).then(() => '', error => String(error)),
@@ -155,10 +183,22 @@ window.startAutoBridge = (url) => {
       completed.push(batch); return batch;
     };
 
-    const sameWindow = await runBatch([0, 1], [firstSession, firstSession], 'stop');
+    const sameWindow = await runBatch([0, 1], [firstSession, firstSession], 'stop', false, groupIds);
     assert.equal(sameWindow.status, 'passed');
     assert.deepEqual(sameWindow.items.map(item => item.status), ['passed', 'passed']);
     assert.deepEqual(hits.map(hit => [hit.who, hit.action]), [['first', 'A'], ['first', 'B']], 'same-window items execute once and in order');
+    const firstBatchGroups = [{ id: groupIds[0], name: 'Group A' }, { id: groupIds[1], name: 'Group B' }];
+    assert.deepEqual(sameWindow.groups, firstBatchGroups);
+    assert.deepEqual(sameWindow.items.map(item => ({ caseId: item.caseId, groupNames: item.groupNames })), [
+      { caseId: refs.cases[0]!.caseId, groupNames: ['Group A', 'Group B'] },
+      { caseId: refs.cases[1]!.caseId, groupNames: ['Group B'] },
+    ], 'overlapping groups merge group references while executing each case once');
+    await ui.evaluate(async ({ refs, groupId }) => {
+      const original = (await window.workspace.state()).projects.find(project => project.id === refs.projectId)!.groups!.find(group => group.id === groupId)!;
+      await window.workspace.saveGroup({ projectId: refs.projectId, id: original.id, revision: original.revision, name: 'Renamed Group A', description: 'Changed after running', caseIds: [refs.cases[1]!.caseId] });
+    }, { refs, groupId: groupIds[0]! });
+    const historicalGroupBatch = (await ui.evaluate(() => window.workspace.state())).batches!.find(batch => batch.id === sameWindow.id)!;
+    assert.deepEqual(historicalGroupBatch, sameWindow, 'editing a group never changes a previous batch name or membership snapshot');
     await first.bringToFront();
     const separateWindows = await runBatch([0, 1], [secondSession, firstSession], 'stop');
     assert.equal(separateWindows.status, 'passed');
@@ -177,7 +217,8 @@ window.startAutoBridge = (url) => {
     assert.equal(cancelled.status, 'cancelled');
     assert.deepEqual(cancelled.items.map(item => item.status), ['cancelled', 'skipped']);
     assert.equal(hits.length, beforeCancel, 'cancelled batches never launch later sends');
-    assert.ok(hits.every(hit => hit.cookie.includes('session=batch-fixture')));
+    assert.ok(hits.every(hit => hit.cookie.includes('session=batch-fixture') && hit.method === 'POST'));
+    assert.equal(new Set(hits.map(hit => hit.who + ':' + hit.clickId)).size, hits.length, 'each sent request corresponds to a distinct browser click');
     for (const target of [first, second]) {
       assert.equal(target.isClosed(), false);
       assert.equal(await target.evaluate(() => localStorage.getItem('loggedIn')), 'yes');
@@ -188,6 +229,8 @@ window.startAutoBridge = (url) => {
     await app.close(); app = await electron.launch({ args: [root], env, timeout: 45_000 });
     ui = await app.firstWindow();
     const restored = await ui.evaluate(() => window.workspace.state());
+    assert.deepEqual(restored.projects.find(project => project.id === refs.projectId)!.groups, beforeRestart.projects.find(project => project.id === refs.projectId)!.groups, 'group YAML definitions survive a restart');
+    assert.equal(restored.projects.find(project => project.id === refs.projectId)!.groups!.find(group => group.id === groupIds[0])!.name, 'Renamed Group A');
     assert.equal(restored.sessions!.length, 0, 'live browser bindings do not survive application restart');
     assert.equal(restored.activeBatchId, undefined);
     assert.deepEqual(restored.batches, beforeRestart.batches);
@@ -197,9 +240,10 @@ window.startAutoBridge = (url) => {
     assert.deepEqual(uiErrors, []);
     const automaticConnections = await extensionPage.evaluate(() => (window as any).autoBridgeConnections);
     assert.equal(automaticConnections, 10, 'two session confirmations and eight runs reconnect automatically without per-run test assistance');
-    writeFileSync(path.join(dir, 'observations.json'), JSON.stringify({ automaticConnections, targets, hits, batches: completed, restoredSessionCount: restored.sessions!.length, restoredRuns: restored.runs.length }, null, 2));
+    writeFileSync(path.join(dir, 'observations.json'), JSON.stringify({ automaticConnections, invalidGroups, restoredGroups: restored.projects.find(project => project.id === refs.projectId)!.groups, targets, hits, batches: completed, restoredSessionCount: restored.sessions!.length, restoredRuns: restored.runs.length }, null, 2));
     console.log('Batch integration evidence:', dir);
   } catch (error) {
+    writeFileSync(path.join(dir, 'failure-hits.json'), JSON.stringify(hits, null, 2));
     if (ui && !ui.isClosed()) {
       writeFileSync(path.join(dir, 'failure-state.json'), JSON.stringify(await ui.evaluate(() => window.workspace.state()).catch(() => null), null, 2));
       await ui.screenshot({ path: path.join(dir, 'failure.png') }).catch(() => {});
