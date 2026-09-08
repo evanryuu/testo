@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { test } from 'node:test';
 import { parse, stringify } from 'yaml';
-import { buildRecordedWorkflow, RECORDING_VIEWPORT, type RecorderEvent } from '../src/recording/workflow.js';
+import { buildRecordedWorkflow, RECORDING_VIEWPORT, type RecorderEvent, type RecordingReviewStep } from '../src/recording/workflow.js';
 import { startRun } from '../src/runner/run.js';
 import { runPlanFromYaml } from '../src/shared/run-steps.js';
 
@@ -179,4 +179,57 @@ test('wait conditions reject blank prompts and invalid time limits', () => {
   for (const timeoutMs of [1000, 300000]) {
     assert.equal(parse(build('回答出现', timeoutMs)).cases[0].steps.at(-1).aiWaitFor.timeoutMs, timeoutMs);
   }
+});
+
+
+test('Timeline checks run between the selected actions while navigation observations remain evidence', () => {
+  const events = [
+    event('InitialNavigation', { url: 'https://example.com' }, 'entry'),
+    event('Tap', { x: 70, y: 40 }, 'send'),
+    { ...event('Navigate', { implicitNavigationState: true }, 'observed-navigation'), type: 'navigation' },
+    event('Tap', { x: 250, y: 40 }, 'continue'),
+  ];
+  const original = structuredClone(events);
+  const timeline: RecordingReviewStep[] = [
+    { kind: 'event', hashId: 'entry' },
+    { kind: 'check', id: 'ready', assertion: { kind: 'wait', text: '输入框可以使用' } },
+    { kind: 'event', hashId: 'send' },
+    { kind: 'event', hashId: 'observed-navigation' },
+    { kind: 'check', id: 'answer', assertion: { kind: 'wait', text: '本次回答结束生成', timeoutMs: 120000 } },
+    { kind: 'check', id: 'relevant', assertion: { kind: 'ai', text: '回答与本次问题相关' } },
+    { kind: 'event', hashId: 'continue' },
+    { kind: 'check', id: 'destination', assertion: { kind: 'text', text: '详情' } },
+  ];
+  const build = (steps: RecordingReviewStep[], skip = false) => parse(buildRecordedWorkflow({
+    name: 'Wait then continue', events, steps,
+    choices: skip ? [{ hashId: 'send', mode: 'skip' }] : [],
+  })).cases[0].steps;
+  const steps = build(timeline);
+  assert.deepEqual(steps.map((step: object) => Object.keys(step)[0]), [
+    'setViewportSize', 'gotoUrl', 'aiWaitFor', 'recordedAction', 'aiWaitFor', 'aiAssert', 'recordedAction', 'assertText',
+  ]);
+  assert.equal(steps[4].aiWaitFor.timeoutMs, 120000);
+  assert.deepEqual(steps[6].recordedAction.payload, { x: 250, y: 40 });
+  const moved = [...timeline];
+  moved.splice(6, 0, ...moved.splice(4, 1));
+  assert.deepEqual(build(moved).slice(-4).map((step: object) => Object.keys(step)[0]), ['aiAssert', 'recordedAction', 'aiWaitFor', 'assertText']);
+  const removed = timeline.filter(step => step.kind !== 'check' || step.id !== 'answer');
+  assert.ok(!build(removed).some((step: any) => step.aiWaitFor?.prompt === '本次回答结束生成'));
+  assert.equal(build(timeline, true).filter((step: object) => 'recordedAction' in step).length, 1);
+  assert.deepEqual(events, original, 'editing checks must not rewrite recorded events or evidence');
+});
+
+test('stale or ambiguous Timeline edits cannot silently omit, duplicate or reorder recorded actions', () => {
+  const events = [event('Tap', { x: 70, y: 40 }, 'send'), event('Tap', { x: 250, y: 40 }, 'continue')];
+  const references: RecordingReviewStep[] = events.map(({ hashId }) => ({ kind: 'event', hashId }));
+  const check: RecordingReviewStep = { kind: 'check', id: 'wait', assertion: { kind: 'wait', text: '本次回答完成' } };
+  const build = (steps: RecordingReviewStep[]) => buildRecordedWorkflow({ name: 'Send', events, steps });
+  for (const steps of [[], references.slice(1), [references[0]!, references[0]!], [...references].reverse(), [references[0]!, { kind: 'event' as const, hashId: 'stale' }]]) {
+    assert.throws(() => build(steps), /Timeline/);
+  }
+  assert.throws(() => build([...references, check, check]), /标识重复/);
+  assert.throws(() => buildRecordedWorkflow({ name: 'Send', events, steps: references, assertions: [{ kind: 'ai', text: '重复检查' }] }), /末尾断言/);
+  assert.throws(() => buildRecordedWorkflow({ name: 'Send', events, steps: [...references, check], choices: events.map(({ hashId }) => ({ hashId, mode: 'skip' })) }), /至少录制一个操作/);
+  assert.throws(() => build([...references, { ...check, assertion: { kind: 'wait', text: ' ' } }]), /等待条件不能为空/);
+  assert.throws(() => build([...references, { ...check, assertion: { kind: 'wait', text: '完成', timeoutMs: 999 } }]), /最长等待时间/);
 });

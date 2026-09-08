@@ -150,13 +150,13 @@ const handlers: Record<string, (input: any) => unknown> = {
   buildRecording: (i) => {
     const draft = recorder.require(i.id);
     if (recorder.active) throw new Error('请先停止录制');
-    return buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions, ...(draft.browserMode === 'bridge' ? { viewport: draft.viewport, startUrl: draft.startUrl } : {}) });
+    return buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions, steps: i.steps, ...(draft.browserMode === 'bridge' ? { viewport: draft.viewport, startUrl: draft.startUrl } : {}) });
   },
   saveRecording: (i) => {
     const draft = recorder.require(i.id);
     if (recorder.active) throw new Error('请先停止录制');
     if (draft.status === 'saved') throw new Error('本次录制已经保存');
-    const text = buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions, ...(draft.browserMode === 'bridge' ? { viewport: draft.viewport, startUrl: draft.startUrl } : {}) });
+    const text = buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions, steps: i.steps, ...(draft.browserMode === 'bridge' ? { viewport: draft.viewport, startUrl: draft.startUrl } : {}) });
     validateWorkflow(text);
     store.saveWorkflow({ projectId: draft.projectId, caseId: draft.caseId, workflowId: draft.workflowId, revision: draft.revision, text });
     recorder.saved(i.id);

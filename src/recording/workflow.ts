@@ -16,6 +16,16 @@ export interface RecorderEvent {
 }
 export interface RecordingStepChoice { hashId: string; mode: 'recorded' | 'ai' | 'skip'; prompt?: string; confirmedPrompt?: string }
 export interface RecordingAssertion { kind: 'text' | 'ai' | 'wait'; text: string; timeoutMs?: number }
+export type RecordingReviewStep =
+  | { kind: 'event'; hashId: string }
+  | { kind: 'check'; id: string; assertion: RecordingAssertion };
+
+const reviewStepsSchema = z.array(z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('event'), hashId: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal('check'), id: z.string().min(1), assertion: z.object({
+    kind: z.enum(['text', 'ai', 'wait']), text: z.string(), timeoutMs: z.number().optional(),
+  }).strict() }).strict(),
+]));
 
 const point = { x: z.number().finite().min(0).max(16383).optional(), y: z.number().finite().min(0).max(16383).optional() };
 export const recordedActionSchema = z.object({
@@ -52,6 +62,7 @@ export function buildRecordedWorkflow(input: {
   events: RecorderEvent[];
   choices?: RecordingStepChoice[];
   assertions?: RecordingAssertion[];
+  steps?: RecordingReviewStep[];
   viewport?: { width: number; height: number };
   startUrl?: string;
 }): string {
@@ -60,13 +71,41 @@ export function buildRecordedWorkflow(input: {
   if (choices.size !== (input.choices ?? []).length) throw new Error('录制步骤设置重复');
   const ids = new Set(input.events.map((event) => event.hashId));
   for (const id of choices.keys()) if (!ids.has(id)) throw new Error(`找不到录制步骤：${id}`);
+  if (ids.size !== input.events.length) throw new Error('录制事件标识重复');
+  if (input.steps !== undefined && input.assertions?.length) throw new Error('请使用 Timeline 中的检查步骤，不要重复传入末尾断言');
+  const reviewSteps: RecordingReviewStep[] = input.steps === undefined
+    ? [...input.events.map(event => ({ kind: 'event' as const, hashId: event.hashId })),
+      ...(input.assertions ?? []).map((assertion, index) => ({ kind: 'check' as const, id: `legacy-${index}`, assertion }))]
+    : reviewStepsSchema.parse(input.steps);
+  const eventIds = reviewSteps.flatMap(step => step.kind === 'event' ? [step.hashId] : []);
+  if (eventIds.length !== input.events.length || eventIds.some((id, index) => id !== input.events[index]?.hashId)) {
+    throw new Error('Timeline 的录制事件缺失、重复或顺序发生变化，请重新检查草稿');
+  }
+  const checkIds = reviewSteps.flatMap(step => step.kind === 'check' ? [step.id] : []);
+  if (new Set(checkIds).size !== checkIds.length) throw new Error('Timeline 的检查步骤标识重复');
+  const events = new Map(input.events.map(event => [event.hashId, event]));
   const viewport = input.viewport ?? RECORDING_VIEWPORT;
   const steps: Record<string, unknown>[] = [];
-  for (const event of input.events) {
+  let replayActions = 0;
+  for (const item of reviewSteps) {
+    if (item.kind === 'check') {
+      const assertion = item.assertion;
+      if (!assertion.text.trim()) throw new Error(assertion.kind === 'wait' ? '等待条件不能为空' : '断言内容不能为空');
+      if (assertion.kind === 'text') steps.push({ assertText: { text: assertion.text.trim() } });
+      else if (assertion.kind === 'ai') steps.push({ aiAssert: assertion.text.trim() });
+      else if (assertion.kind === 'wait') {
+        const timeoutMs = assertion.timeoutMs ?? 60000;
+        if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 300000) throw new Error('最长等待时间必须在 1 到 300 秒之间');
+        steps.push({ aiWaitFor: { prompt: assertion.text.trim(), timeoutMs } });
+      } else throw new Error('不支持的断言类型');
+      continue;
+    }
+    const event = events.get(item.hashId)!;
     const payload = event.rawPayload ?? {};
     if (event.actionType === 'InitialNavigation' || (payload.implicitNavigationState === true && event.type === 'navigation')) continue;
     const choice = choices.get(event.hashId);
     if (choice?.mode === 'skip') continue;
+    replayActions++;
     const actionType = event.actionType;
     if (!['Tap', 'Input', 'KeyboardPress', 'Scroll', 'Navigate', 'DragAndDrop'].includes(actionType ?? '')) throw new Error(`暂不支持录制操作：${actionType ?? event.type ?? '未知'}，请删除该步骤后重新录制`);
     if (choice?.mode === 'ai') {
@@ -88,20 +127,9 @@ export function buildRecordedWorkflow(input: {
       steps.push({ recordedAction: action });
     }
   }
-  if (!steps.length) throw new Error('请至少录制一个操作');
+  if (!replayActions) throw new Error('请至少录制一个操作');
   const needsViewport = steps.some(step => 'recordedAction' in step);
   steps.unshift({ gotoUrl: { url: input.startUrl ?? '${baseUrl}' } });
   if (needsViewport) steps.unshift(input.viewport ? { requireViewport: viewport } : { setViewportSize: viewport });
-  for (const assertion of input.assertions ?? []) {
-    if (!assertion.text.trim()) throw new Error(assertion.kind === 'wait' ? '等待条件不能为空' : '断言内容不能为空');
-    if (assertion.kind === 'text') steps.push({ assertText: { text: assertion.text.trim() } });
-    else if (assertion.kind === 'ai') steps.push({ aiAssert: assertion.text.trim() });
-    else if (assertion.kind === 'wait') {
-      const timeoutMs = assertion.timeoutMs ?? 60000;
-      if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 300000) throw new Error('最长等待时间必须在 1 到 300 秒之间');
-      steps.push({ aiWaitFor: { prompt: assertion.text.trim(), timeoutMs } });
-    }
-    else throw new Error('不支持的断言类型');
-  }
   return stringify({ cases: [{ name: input.name.trim(), steps }], afterEach: [{ recordToReport: '录制回放结束时的页面' }] });
 }

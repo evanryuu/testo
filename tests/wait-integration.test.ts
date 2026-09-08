@@ -5,7 +5,8 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { expect } from '@playwright/test';
 import { _electron as electron, type ElectronApplication } from 'playwright';
-import { parse, stringify } from 'yaml';
+import { parse } from 'yaml';
+import { buildRecordedWorkflow } from '../src/recording/workflow.js';
 import { startRun } from '../src/runner/run.js';
 
 const cleanEnvironment = () => Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] =>
@@ -15,15 +16,16 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 test('real Chrome waits for a delayed answer, bounds absent answers and cancels a hanging model request', { timeout: 90000 }, async () => {
   mkdirSync('artifacts', { recursive: true });
   const root = mkdtempSync(path.resolve('artifacts/wait-integration-'));
-  let ready = false, followUps = 0;
+  let ready = false, followUps = 0, sends = 0;
   const calls: { model: string; pass: boolean; image: boolean; version?: string }[] = [];
   const held: ServerResponse[] = [];
   const server = createServer((request, response) => {
+    if (request.url === '/send') { sends++; response.end('ok'); return; }
     if (request.url === '/ready') { ready = true; response.end('ok'); return; }
     if (request.url === '/follow-up') { followUps++; response.end('ok'); return; }
     if (request.url !== '/v1/chat/completions') {
       response.setHeader('Content-Type', 'text/html; charset=utf-8');
-      response.end(`<!doctype html><button style="position:absolute;left:20px;top:20px;width:120px;height:40px" onclick="document.querySelector('p').textContent='Inferring...';setTimeout(()=>{document.querySelector('p').textContent='Current answer is ready';fetch('/ready')},3500)">Send</button><button style="position:absolute;left:200px;top:20px;width:120px;height:40px" onclick="fetch('/follow-up')">Continue</button><p style="position:absolute;top:100px"></p>`);
+      response.end(`<!doctype html><button style="position:absolute;left:20px;top:20px;width:120px;height:40px" onclick="fetch('/send');document.querySelector('p').textContent='Inferring...';setTimeout(()=>{document.querySelector('p').textContent='Current answer is ready';fetch('/ready')},3500)">Send</button><button style="position:absolute;left:200px;top:20px;width:120px;height:40px" onclick="fetch('/follow-up');document.querySelector('p').textContent='Follow-up complete'">Continue</button><p style="position:absolute;top:100px"></p>`);
       return;
     }
     let body = '';
@@ -49,13 +51,22 @@ test('real Chrome waits for a delayed answer, bounds absent answers and cancels 
     for (const model of ['wait-success', 'wait-timeout', 'wait-cancel']) {
       ready = false;
       const workflowPath = path.join(root, model + '.yaml');
-      const steps = [
-        { gotoUrl: { url: '${baseUrl}' } },
-        { recordedAction: { actionType: 'Tap', payload: { x: 70, y: 40 } } },
-        { aiWaitFor: { prompt: 'The current answer is visible', timeoutMs: model === 'wait-timeout' ? 1800 : 15000, checkIntervalMs: 200 } },
-        { recordedAction: { actionType: 'Tap', payload: { x: 250, y: 40 } } },
-      ];
-      writeFileSync(workflowPath, stringify({ cases: [{ name: model, steps }], afterEach: [{ recordToReport: 'After waiting' }] }));
+      const sentBeforeRun = sends;
+      const yaml = buildRecordedWorkflow({
+        name: model,
+        events: [
+          { hashId: 'send', actionType: 'Tap', rawPayload: { x: 70, y: 40 }, pageInfo: { width: 1280, height: 800 } },
+          { hashId: 'continue', actionType: 'Tap', rawPayload: { x: 250, y: 40 }, pageInfo: { width: 1280, height: 800 } },
+        ],
+        steps: [
+          { kind: 'event', hashId: 'send' },
+          { kind: 'check', id: 'answer-ready', assertion: { kind: 'wait', text: 'The current answer is visible', timeoutMs: model === 'wait-timeout' ? 1800 : 15000 } },
+          { kind: 'event', hashId: 'continue' },
+          { kind: 'check', id: 'follow-up-result', assertion: { kind: 'text', text: 'Follow-up complete' } },
+        ],
+      });
+      writeFileSync(workflowPath, yaml);
+      const continueIndex = parse(yaml).cases[0].steps.findIndex((step: any) => step.recordedAction?.payload.x === 250);
       const events: any[] = [];
       const handle = startRun({ workflowPath, artifactRoot: root, baseUrl, channel: 'chrome', headless: true }, event => events.push(event), {
         ...cleanEnvironment(), MIDSCENE_MODEL_NAME: model, MIDSCENE_MODEL_FAMILY: 'gpt-5', MIDSCENE_MODEL_BASE_URL: baseUrl + '/v1',
@@ -67,6 +78,7 @@ test('real Chrome waits for a delayed answer, bounds absent answers and cancels 
       }
       const result = await handle.result;
       assert.equal(result.status, model === 'wait-success' ? 'passed' : model === 'wait-timeout' ? 'failed' : 'cancelled', JSON.stringify(result));
+      assert.equal(sends - sentBeforeRun, 1, 'waiting never repeats the send action');
       const observed = calls.filter(call => call.model === model);
       assert.ok(observed.length > 0);
       if (model === 'wait-success') {
@@ -76,7 +88,7 @@ test('real Chrome waits for a delayed answer, bounds absent answers and cancels 
         assert.ok(result.reportPaths.length);
       } else {
         assert.equal(followUps, 1, 'failure/cancellation must not execute the subsequent action');
-        assert.ok(!events.some(event => event.type === 'step-started' && event.index === 3));
+        assert.ok(!events.some(event => event.type === 'step-started' && event.index === continueIndex));
         if (model === 'wait-timeout') assert.match(result.error ?? '', /等待条件超时/);
         if (model === 'wait-cancel') {
           const count = calls.length;
@@ -88,7 +100,7 @@ test('real Chrome waits for a delayed answer, bounds absent answers and cancels 
       }
     }
     assert.ok(calls.every(call => call.image && call.version), 'the official SDK sends a fresh real screenshot through HTTP');
-    writeFileSync(path.join(root, 'observations.json'), JSON.stringify({ calls, followUps }, null, 2));
+    writeFileSync(path.join(root, 'observations.json'), JSON.stringify({ calls, followUps, sends }, null, 2));
     console.log('Wait integration evidence:', root);
   } finally {
     for (const response of held) response.end();
@@ -97,12 +109,12 @@ test('real Chrome waits for a delayed answer, bounds absent answers and cancels 
   }
 });
 
-test('Electron recording review configures and saves waits in the chosen order', { timeout: 90000 }, async () => {
+test('Electron Timeline inserts, moves, removes and restores checks between recorded actions', { timeout: 90000 }, async () => {
   mkdirSync('artifacts', { recursive: true });
   const root = process.cwd(), data = mkdtempSync(path.resolve('artifacts/wait-ui-'));
   const server = createServer((_req, response) => {
     response.setHeader('Content-Type', 'text/html; charset=utf-8');
-    response.end('<!doctype html><button style="position:absolute;left:20px;top:20px;width:120px;height:40px" onclick="this.textContent=\'Sent\'">Send</button>');
+    response.end('<!doctype html><button style="position:absolute;left:20px;top:20px;width:120px;height:40px" onclick="this.textContent=\'Sent\'">Send</button><button style="position:absolute;left:200px;top:20px;width:120px;height:40px" onclick="this.textContent=\'Continued\'">Continue</button>');
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert.ok(address && typeof address !== 'string');
@@ -130,26 +142,95 @@ test('Electron recording review configures and saves waits in the chosen order',
     const box = await preview.locator('.screenshot-image').boundingBox(); assert.ok(box);
     await page.mouse.click(box.x + 70 * box.width / 1280, box.y + 40 * box.height / 800);
     await expect.poll(() => page.evaluate(async () => (await window.workspace.state()).recording!.events.some(event => event.actionType === 'Tap'))).toBeTruthy();
+    await page.mouse.click(box.x + 250 * box.width / 1280, box.y + 40 * box.height / 800);
+    await expect.poll(() => page.evaluate(async () => (await window.workspace.state()).recording!.events.filter(event => event.actionType === 'Tap').length)).toBe(2);
     await page.getByRole('button', { name: '停止录制并检查', exact: true }).click();
-    await page.getByRole('button', { name: '添加等待条件', exact: true }).click();
-    await page.getByLabel('断言 1 内容', { exact: true }).fill('最新消息下方出现非空的 AI 回复');
+    await page.getByRole('button', { name: '插入等待条件', exact: true }).waitFor();
+    const draft = await page.evaluate(async () => (await window.workspace.state()).recording!);
+    const tapEvents = draft.events.filter(event => event.actionType === 'Tap');
+    const sendId = tapEvents[0]!.hashId, continueId = tapEvents[1]!.hashId;
+    const reviewKey = 'recording-review:' + draft.id;
+
+    // A draft from the previous release restores its tail checks before editing.
+    await page.evaluate(key => localStorage.setItem(key, JSON.stringify({
+      choices: [], assertions: [{ kind: 'wait', text: '旧草稿的等待条件', timeoutMs: 45000 }],
+    })), reviewKey);
+    await page.reload();
+    await page.getByRole('button', { name: '打开录制', exact: true }).click();
+    await expect(page.getByLabel('断言 1 内容', { exact: true })).toHaveValue('旧草稿的等待条件');
+    await expect(page.getByLabel('等待条件 1 最长等待秒数')).toHaveValue('45');
+    await expect(page.locator('[data-review-step]').last()).toHaveAttribute('data-review-check', /.+/);
+    await page.getByRole('button', { name: '移除断言 1', exact: true }).click();
+
+    await page.getByLabel('检查步骤插入位置').selectOption(String(draft.events.findIndex(event => event.hashId === sendId) + 1));
+    await page.getByRole('button', { name: '插入等待条件', exact: true }).click();
+    await page.getByLabel('断言 1 内容', { exact: true }).fill('回复生成结束，停止按钮消失');
     await expect(page.getByLabel('等待条件 1 最长等待秒数')).toHaveValue('60');
-    await page.getByRole('button', { name: '添加等待条件', exact: true }).click();
-    await page.getByLabel('断言 2 内容', { exact: true }).fill('回复生成结束，停止按钮消失');
-    await page.getByLabel('等待条件 2 最长等待秒数').fill('120');
+    await page.getByLabel('等待条件 1 最长等待秒数').fill('120');
+    const waitId = await page.locator('[data-review-check]').first().getAttribute('data-review-check'); assert.ok(waitId);
+    const order = () => page.locator('[data-review-step]').evaluateAll((elements, ids) => elements.map(element => element.getAttribute('data-review-step')).filter(id => ids.includes(id!)), [sendId, continueId, waitId]);
+    assert.deepEqual(await order(), [sendId, waitId, continueId]);
+    await page.getByRole('button', { name: '下移检查 1', exact: true }).click();
+    assert.deepEqual(await order(), [sendId, continueId, waitId]);
+    await page.getByRole('button', { name: '上移检查 1', exact: true }).click();
+    assert.deepEqual(await order(), [sendId, waitId, continueId]);
+
+    const currentOrder = await page.locator('[data-review-step]').evaluateAll(elements => elements.map(element => element.getAttribute('data-review-step')));
+    await page.getByLabel('检查步骤插入位置').selectOption(String(currentOrder.indexOf(waitId) + 1));
+    await page.getByRole('button', { name: '插入断言', exact: true }).click();
+    await page.getByLabel('断言 2 内容', { exact: true }).fill('应删除的临时检查');
+    await page.getByRole('button', { name: '移除断言 2', exact: true }).click();
+    await expect(page.locator('[data-review-check]')).toHaveCount(1);
     await page.getByRole('button', { name: '添加断言', exact: true }).click();
-    await page.getByLabel('断言 3 类型', { exact: true }).selectOption('ai');
-    await page.getByLabel('断言 3 内容', { exact: true }).fill('回答与本次问题相关');
+    await page.getByLabel('断言 2 类型', { exact: true }).selectOption('ai');
+    await page.getByLabel('断言 2 内容', { exact: true }).fill('继续操作成功');
+
+    const storedBeforeReload = await page.evaluate(key => JSON.parse(localStorage.getItem(key)!), reviewKey);
+    await page.reload();
+    await page.getByRole('button', { name: '打开录制', exact: true }).click();
+    await expect(page.getByLabel('断言 1 内容', { exact: true })).toHaveValue('回复生成结束，停止按钮消失');
+    await expect(page.getByLabel('等待条件 1 最长等待秒数')).toHaveValue('120');
+    await expect(page.getByLabel('断言 2 类型', { exact: true })).toHaveValue('ai');
+    await expect(page.getByLabel('断言 2 内容', { exact: true })).toHaveValue('继续操作成功');
+    assert.deepEqual(await order(), [sendId, waitId, continueId], 'refresh restores the wait between its original actions');
+    assert.deepEqual(await page.evaluate(key => JSON.parse(localStorage.getItem(key)!), reviewKey), storedBeforeReload, 'refresh preserves stable check identities and all review content');
+
+
+    // Damaged draft references must be repaired explicitly, without silently relocating checks.
+    await page.evaluate(({ key, review, missingId }) => localStorage.setItem(key, JSON.stringify({
+      ...review, steps: review.steps.filter((step: any) => step.kind !== 'event' || step.hashId !== missingId),
+    })), { key: reviewKey, review: storedBeforeReload, missingId: sendId });
+    await page.reload();
+    await page.getByRole('button', { name: '打开录制', exact: true }).click();
+    await expect(page.getByText(/保存的步骤与当前录制事件不一致/)).toBeVisible();
+    await expect(page.getByRole('button', { name: '保存到当前用例', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '预览 YAML', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: '恢复事件顺序并将检查移至末尾', exact: true }).click();
+    assert.deepEqual(await order(), [sendId, continueId, waitId]);
+    await expect(page.getByLabel('断言 1 内容', { exact: true })).toHaveValue('回复生成结束，停止按钮消失');
+    await expect(page.getByLabel('等待条件 1 最长等待秒数')).toHaveValue('120');
+    await expect(page.getByLabel('断言 2 内容', { exact: true })).toHaveValue('继续操作成功');
+    await expect(page.getByRole('button', { name: '保存到当前用例', exact: true })).toBeEnabled();
+    await page.evaluate(({ key, review }) => localStorage.setItem(key, JSON.stringify(review)), { key: reviewKey, review: storedBeforeReload });
+    await page.reload();
+    await page.getByRole('button', { name: '打开录制', exact: true }).click();
+    assert.deepEqual(await order(), [sendId, waitId, continueId]);
+
     await page.getByRole('button', { name: '预览 YAML', exact: true }).click();
     const yaml = await page.getByLabel('生成的 Workflow YAML').innerText();
-    assert.deepEqual(parse(yaml).cases[0].steps.slice(-3), [
-      { aiWaitFor: { prompt: '最新消息下方出现非空的 AI 回复', timeoutMs: 60000 } },
-      { aiWaitFor: { prompt: '回复生成结束，停止按钮消失', timeoutMs: 120000 } },
-      { aiAssert: '回答与本次问题相关' },
-    ]);
+    const generatedSteps = parse(yaml).cases[0].steps;
+    assert.deepEqual(generatedSteps.map((step: any) => Object.keys(step)[0]), ['setViewportSize', 'gotoUrl', 'recordedAction', 'aiWaitFor', 'recordedAction', 'aiAssert']);
+    assert.equal(generatedSteps[2].recordedAction.payload.x, tapEvents[0]!.rawPayload!.x);
+    assert.deepEqual(generatedSteps[3], { aiWaitFor: { prompt: '回复生成结束，停止按钮消失', timeoutMs: 120000 } });
+    assert.equal(generatedSteps[4].recordedAction.payload.x, tapEvents[1]!.rawPayload!.x);
+    assert.deepEqual(generatedSteps[5], { aiAssert: '继续操作成功' });
+    assert.ok(!yaml.includes('应删除的临时检查') && !yaml.includes('旧草稿的等待条件'));
     writeFileSync(path.join(data, 'preview.yaml'), yaml);
-    await page.getByRole('button', { name: '添加等待条件', exact: true }).scrollIntoViewIfNeeded();
+    await page.locator('[data-review-check]').first().scrollIntoViewIfNeeded();
     await page.screenshot({ path: path.join(data, 'wait-review.png'), fullPage: true });
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1600, 1200));
+    await page.locator('[data-recorder-event="' + sendId + '"]').evaluate(element => element.parentElement!.scrollTop = (element as HTMLElement).offsetTop - (element.parentElement as HTMLElement).offsetTop);
+    await page.locator('[data-slot="card"]').filter({ has: page.getByText('Timeline', { exact: true }) }).screenshot({ path: path.join(data, 'timeline-middle-wait.png') });
     await page.getByRole('button', { name: '保存到当前用例', exact: true }).click();
     await page.getByRole('button', { name: '运行', exact: true }).waitFor();
     const state = await page.evaluate(() => window.workspace.state());

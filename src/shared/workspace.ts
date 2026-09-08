@@ -1,5 +1,5 @@
 import type { RecordingDraft, RecordingFrame, RecordingInteraction } from './recording.js';
-import type { RecordingStepChoice, RecordingAssertion } from '../recording/workflow.js';
+import type { RecordingStepChoice, RecordingAssertion, RecordingReviewStep } from '../recording/workflow.js';
 import type { RunResult, WorkerEvent } from '../runner/messages.js';
 
 export interface Suite { id: string; name: string; directory: string }
@@ -46,8 +46,8 @@ export interface DesktopApi {
   recordingInteract(input: { id: string; action: RecordingInteraction }): Promise<void>;
   stopRecording(input: { id: string }): Promise<void>;
   discardRecording(input: { id: string }): Promise<void>;
-  buildRecording(input: { id: string; choices: RecordingStepChoice[]; assertions: RecordingAssertion[] }): Promise<string>;
-  saveRecording(input: { id: string; choices: RecordingStepChoice[]; assertions: RecordingAssertion[] }): Promise<void>;
+  buildRecording(input: { id: string; choices: RecordingStepChoice[]; assertions?: RecordingAssertion[]; steps?: RecordingReviewStep[] }): Promise<string>;
+  saveRecording(input: { id: string; choices: RecordingStepChoice[]; assertions?: RecordingAssertion[]; steps?: RecordingReviewStep[] }): Promise<void>;
   onChange(listener: () => void): () => void;
 }
 
