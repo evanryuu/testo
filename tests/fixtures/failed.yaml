@@ -1,0 +1,8 @@
+cases:
+  - name: Navigation fails and cleanup still runs
+    steps:
+      - gotoUrl:
+          url: /disconnect
+          timeoutMs: 3000
+afterEach:
+  - recordToReport: Failed navigation cleanup

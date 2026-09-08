@@ -1,0 +1,7 @@
+cases:
+  - name: Send message while logged out
+    steps:
+      - gotoUrl:
+          url: ${baseUrl}
+      - aiAct: 在聊天输入框输入 Hi，然后点击发送。
+      - aiAssert: 页面显示了针对这条消息的非空回答。

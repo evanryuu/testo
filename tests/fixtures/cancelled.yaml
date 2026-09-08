@@ -1,0 +1,11 @@
+cases:
+  - name: Cancel while a step is running
+    steps:
+      - gotoUrl:
+          url: ${baseUrl}
+      - recordToReport: Before cancellation
+      - wait:
+          duration: 60
+          unit: s
+afterEach:
+  - recordToReport: Cleanup after cancellation

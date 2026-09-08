@@ -1,0 +1,6 @@
+cases:
+  - name: Open a real page and capture a Midscene report
+    steps:
+      - gotoUrl:
+          url: ${baseUrl}
+      - recordToReport: Web runner verification

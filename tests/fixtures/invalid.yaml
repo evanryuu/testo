@@ -1,0 +1,4 @@
+cases:
+  - name: Unregistered node
+    steps:
+      - imaginaryNode: This must fail before opening a browser

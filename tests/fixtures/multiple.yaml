@@ -1,0 +1,7 @@
+cases:
+  - name: First
+    steps:
+      - wait: { duration: 1 }
+  - name: Second
+    steps:
+      - wait: { duration: 1 }
