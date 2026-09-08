@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { AgentOverChromeBridge } from '@midscene/web/bridge-mode';
 import { waitForStableViewport, type ViewportSize } from './viewport.js';
 
@@ -66,10 +67,11 @@ export async function connectChrome(agent: AgentOverChromeBridge, origin: string
   try {
     if (target) {
       if (target.origin !== origin) throw new Error('Chrome 会话与所选环境不一致，请重新连接并录制');
-      const tabs = await agent.getBrowserTabList();
-      const tab = tabs.find((tab) => tab.id === target.tabId);
-      if (!tab || new URL(tab.url).origin !== origin) throw new Error('原来的 Chrome 标签页已关闭、移到其他窗口或离开目标网站，请重新连接');
-      await agent.setActiveTabId(target.tabId);
+      // The official tab list only covers its current window. Bind the exact ID
+      // first, then verify the origin and confirmation token without navigating.
+      if (!/^[1-9]\d*$/.test(target.tabId)) throw new Error('原来的 Chrome 标签页标识无效，请重新连接');
+      try { await agent.setActiveTabId(target.tabId); }
+      catch (error) { throw new Error(`原来的 Chrome 标签页无法连接，请重新连接：${error instanceof Error ? error.message : String(error)}`); }
     } else {
       // Avoid Agent's animation configuration: disabling it attaches the debugger.
       // The public page connection leaves manual login untouched until begin.
@@ -80,10 +82,21 @@ export async function connectChrome(agent: AgentOverChromeBridge, origin: string
     if (target?.sessionToken && await bridgeValue(agent.interface, `sessionStorage.getItem('__testing_workspace_bridge_session')`) !== target.sessionToken) throw new Error('原来的 Chrome 会话已更换，请重新连接并确认登录');
     const tabId = await agent.interface.getActiveTabId();
     if (!tabId) throw new Error('未找到连接的 Chrome 标签页');
+    if (target && String(tabId) !== target.tabId) throw new Error('连接的 Chrome 标签页与已确认会话不一致');
     return { tabId: String(tabId), origin };
   } catch (error) {
     throw new Error(`连接 Chrome 失败：${error instanceof Error ? error.message : String(error)}。请确认已安装并允许 Midscene 扩展的 Bridge 连接，且没有其他 Midscene 会话占用连接。`);
   }
+}
+
+export async function captureChromeSession(origin: string): Promise<ChromeTarget> {
+  const agent = createChromeBridge();
+  try {
+    const target = await connectChrome(agent, origin);
+    const sessionToken = randomUUID();
+    await bridgeValue(agent.interface, `(sessionStorage.setItem('__testing_workspace_bridge_session', ${JSON.stringify(sessionToken)}), true)`);
+    return { ...target, sessionToken };
+  } finally { await agent.destroy(); }
 }
 
 export async function bridgeValue(page: ReturnType<typeof createChromeBridge>['interface'], expression: string): Promise<any> {

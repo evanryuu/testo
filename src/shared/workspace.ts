@@ -16,10 +16,24 @@ export interface Project {
 export interface HistoryRun {
   runId: string; projectId: string; caseId: string; caseName: string; environment: string;
   status: 'running' | 'interrupted' | RunResult['status']; startedAt: string;
+  batchId?: string; sessionName?: string;
   result?: RunResult; events: WorkerEvent[];
 }
+export interface BrowserSession {
+  id: string; name: string; projectId: string; environmentId: string; origin: string;
+}
+export interface BatchInput {
+  projectId: string; environmentId: string; failurePolicy: 'stop' | 'continue';
+  items: { caseId: string; workflowId: string; sessionId: string }[];
+}
+export interface BatchRun {
+  id: string; projectId: string; environment: string; startedAt: string; finishedAt?: string;
+  failurePolicy: 'stop' | 'continue'; status: 'running' | 'passed' | 'failed' | 'cancelled' | 'interrupted';
+  items: { caseId: string; caseName: string; workflowId: string; sessionName: string;
+    status: 'queued' | 'running' | 'skipped' | 'interrupted' | RunResult['status']; runId?: string; error?: string }[];
+}
 export interface ModelSettings { name: string; baseUrl: string; family: string; hasApiKey: boolean }
-export interface WorkspaceState { projects: Project[]; runs: HistoryRun[]; activeRunId?: string; recording?: RecordingDraft; model: ModelSettings; errors: string[] }
+export interface WorkspaceState { projects: Project[]; runs: HistoryRun[]; batches?: BatchRun[]; sessions?: BrowserSession[]; activeBatchId?: string; connectingSession?: boolean; activeRunId?: string; recording?: RecordingDraft; model: ModelSettings; errors: string[] }
 export interface DesktopApi {
   state(): Promise<WorkspaceState>;
   createProject(input: { name: string; description: string }): Promise<string>;
@@ -33,6 +47,9 @@ export interface DesktopApi {
   saveEnvironment(input: { projectId: string; id?: string; name: string; baseUrl: string }): Promise<void>;
   run(input: { projectId: string; caseId: string; workflowId: string; environmentId: string; browserMode?: 'isolated' | 'bridge' }): Promise<string>;
   cancelRun(): Promise<void>;
+  captureSession(input: { projectId: string; environmentId: string; name: string }): Promise<string>;
+  runBatch(input: BatchInput): Promise<string>;
+  cancelBatch(input: { id: string }): Promise<void>;
   runPlan(input: { runId: string }): Promise<import('./run-steps.js').RunStepInfo[]>;
   runScreenshot(input: { runId: string; image: string }): Promise<string>;
   retryRecording(input: { id: string }): Promise<void>;

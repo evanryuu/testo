@@ -1,5 +1,5 @@
 const { contextBridge, ipcRenderer } = require('electron');
-const methods = ['state', 'createProject', 'openProject', 'createSuite', 'createCase', 'saveCase', 'workflow', 'importFile', 'saveWorkflow', 'saveEnvironment', 'run', 'cancelRun', 'openReport', 'runPlan', 'runScreenshot', 'retryRecording', 'saveModel', 'startRecording', 'beginRecording', 'confirmChromeSession', 'recordingFrame', 'recordingScreenshot', 'recordingInteract', 'stopRecording', 'discardRecording', 'buildRecording', 'saveRecording'];
+const methods = ['state', 'createProject', 'openProject', 'createSuite', 'createCase', 'saveCase', 'workflow', 'importFile', 'saveWorkflow', 'saveEnvironment', 'run', 'cancelRun', 'captureSession', 'runBatch', 'cancelBatch', 'openReport', 'runPlan', 'runScreenshot', 'retryRecording', 'saveModel', 'startRecording', 'beginRecording', 'confirmChromeSession', 'recordingFrame', 'recordingScreenshot', 'recordingInteract', 'stopRecording', 'discardRecording', 'buildRecording', 'saveRecording'];
 const api = Object.fromEntries(methods.map((method) => [method, async (input) => {
   const result = await ipcRenderer.invoke('workspace:call', method, input);
   if (!result.ok) throw new Error(result.error);
