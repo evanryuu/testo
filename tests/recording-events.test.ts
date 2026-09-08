@@ -107,3 +107,20 @@ test('a stalled model becomes a failed description and releases the stopped reco
   assert.equal(events.values[0]!.value, 'hi');
   events.close();
 });
+
+
+test('upstream ready descriptions without verification still enter the verification queue', async () => {
+  let calls = 0;
+  const events = new RecorderEvents({ persistScreenshot: async () => {}, changed() {}, idle() {}, describe: async (input) => {
+    calls++;
+    return { ...input, semantic: { source: 'aiDescribe', status: 'failed', aiDescribe: { verifyPrompt: true, verifyPassed: false } } };
+  } });
+  const input = { ...event('unverified'), semantic: { source: 'aiDescribe' as const, status: 'ready' as const, actionSummary: 'Wrong chat' } };
+  await events.update([input]); await drain();
+  assert.equal(calls, 1);
+  assert.equal(events.values[0]!.semantic?.status, 'failed');
+  assert.deepEqual(events.values[0]!.rawPayload, input.rawPayload);
+  await events.update([input]); await drain();
+  assert.equal(calls, 1, 'polling does not repeatedly schedule the same event');
+  events.close();
+});

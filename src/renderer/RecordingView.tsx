@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, Code2, Globe2, ImageIcon, LoaderCircle, Plus, Square, X } from 'lucide-react';
+import { Check, Code2, Globe2, ImageIcon, LoaderCircle, Plus, RotateCw, Square, X } from 'lucide-react';
 import { getMidsceneRecorderEventDescription } from '@midscene/shared/recorder';
-import type { RecordedEvent, RecordingDraft, RecordingFrame, RecordingInteraction } from '../shared/recording.js';
+import { isRecordingDescriptionVerified, type RecordedEvent, type RecordingDraft, type RecordingFrame, type RecordingInteraction } from '../shared/recording.js';
 import type { RecordingAssertion, RecordingStepChoice } from '../recording/workflow.js';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -19,7 +19,7 @@ function label(event: RecordedEvent) {
   if (event.actionType === 'InitialNavigation') return `进入页面 ${event.url ?? ''}`;
   if (event.rawPayload?.implicitNavigationState) return `地址变化 ${event.rawPayload.afterUrl ?? event.url ?? ''}`;
   if (event.actionType === 'Navigate') return `打开页面 ${event.rawPayload?.url ?? event.url ?? ''}`;
-  return getMidsceneRecorderEventDescription(event);
+  return getMidsceneRecorderEventDescription(isRecordingDescriptionVerified(event) ? event : { ...event, semantic: undefined, elementDescription: undefined });
 }
 function EventDetails({ event, recordingId, close }: { event?: RecordedEvent; recordingId: string; close(): void }) {
   const [screenshot, setScreenshot] = useState(''), [error, setError] = useState('');
@@ -47,16 +47,20 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
   const [url, setUrl] = useState(draft.baseUrl), [choices, setChoices] = useState<RecordingStepChoice[]>(savedReview.current.choices ?? []);
   const [assertions, setAssertions] = useState<RecordingAssertion[]>(savedReview.current.assertions ?? []), [yaml, setYaml] = useState(''), [confirmDiscard, setConfirmDiscard] = useState(false);
   useEffect(() => { localStorage.setItem(`recording-review:${draft.id}`, JSON.stringify({ choices, assertions })); }, [draft.id, choices, assertions]);
+  const preparing = draft.status === 'ready';
   const active = draft.status === 'recording', starting = draft.status === 'starting';
   const working = useRef(false);
   const events = draft.events;
   const actions = events.filter((event) => !isNavigationState(event));
+  const canRetry = draft.browserMode === 'bridge' && events.length === 0 && (draft.status === 'interrupted' || (preparing && !!error));
+  const disconnected = draft.status === 'interrupted' && events.length === 0;
+  const hasReplayActions = actions.some((event) => (choices.find((item) => item.hashId === event.hashId)?.mode ?? 'recorded') !== 'skip');
   const [selectedEvent, setSelectedEvent] = useState<RecordedEvent>();
   useEffect(() => {
     let disposed = false, timer: ReturnType<typeof setTimeout>;
     const tick = async () => {
       try {
-        if (!working.current && !starting) {
+        if (!working.current && !starting && !preparing) {
           const next = await window.workspace.recordingFrame({ id: draft.id });
           if (!disposed) setFrame(next);
         }
@@ -65,12 +69,12 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
     };
     void tick();
     return () => { disposed = true; clearTimeout(timer); };
-  }, [draft.id, active, starting]);
+  }, [draft.id, active, starting, preparing]);
   async function act(work: () => Promise<void>) {
     if (working.current) return;
     working.current = true; setBusy(true); setError('');
     try { await work(); await refresh(); }
-    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); await refresh(); }
     finally { working.current = false; setBusy(false); }
   }
   async function interact(action: RecordingInteraction) {
@@ -96,30 +100,32 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
   }
   function choice(hashId: string): RecordingStepChoice { return choices.find((c) => c.hashId === hashId) ?? { hashId, mode: 'recorded' }; }
   function changeChoice(hashId: string, patch: Partial<RecordingStepChoice>) {
-    setChoices((items) => [...items.filter((i) => i.hashId !== hashId), { ...choice(hashId), ...patch }]); setYaml('');
+    setChoices((items) => [...items.filter((i) => i.hashId !== hashId), { ...choice(hashId), ...patch, ...('prompt' in patch ? { confirmedPrompt: undefined } : {}) }]); setYaml('');
   }
   return <div className="flex flex-col gap-6">
     <div className="recording-heading flex flex-wrap items-start justify-between gap-4">
       <div className="space-y-2">
         <span className="text-xs font-semibold tracking-widest text-muted-foreground">WEB RECORDER · MIDSCENE</span>
         <h2 className="text-2xl font-semibold tracking-tight">{draft.caseName}</h2>
-        <p className="text-sm text-muted-foreground">{active ? '直接点击网页后输入文字、粘贴或滚动，操作由 Midscene 官方组件处理。' : starting ? '正在打开目标网页…' : '检查录制步骤，补充预期结果，然后保存到当前用例。'}</p>
+        <p className="text-sm text-muted-foreground">{preparing ? '已连接 Chrome。请在已连接的标签页手动完成登录，回到目标页面后点击「已准备好，开始录制」。准备阶段不采集截图或步骤。' : active ? '直接点击网页后输入文字、粘贴或滚动，操作由 Midscene 官方组件处理。' : starting ? '正在打开目标网页…' : '检查录制步骤，补充预期结果，然后保存到当前用例。'}</p>
       </div>
-      <Badge variant="secondary" className={active ? 'border-red-200 bg-red-50 text-red-600' : ''}>{active ? '● 录制中' : starting ? '准备中' : draft.status === 'saved' ? '已保存' : '待检查'}</Badge>
+      <Badge variant="secondary" className={active ? 'border-red-200 bg-red-50 text-red-600' : ''}>{disconnected ? '连接失败' : preparing ? '等待手动登录' : active ? '● 录制中' : starting ? '准备中' : draft.status === 'saved' ? '已保存' : '待检查'}</Badge>
     </div>
     {error || draft.error ? <Alert variant="destructive"><AlertDescription>{error || draft.error}</AlertDescription></Alert> : null}
-    <div className="grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
+    {canRetry ? <Card><CardContent className="space-y-3"><p className="text-sm leading-6">请在 Chrome 当前标签页打开所选环境的网站，并允许 Midscene 扩展连接。重试会保留当前用例信息。</p><Button disabled={busy || starting} onClick={() => void act(async () => { setFrame(undefined); await window.workspace.retryRecording({ id: draft.id }); })}><RotateCw className={`size-4 ${busy ? 'animate-spin' : ''}`} />{busy ? '正在重新连接…' : '重新连接 Chrome'}</Button></CardContent></Card> : null}
+    {preparing ? <Card><CardContent className="space-y-4"><p className="text-sm leading-7">登录完成后，请返回 Workspace 的预览区域录制业务操作。直接在 Chrome 中操作不会加入 Timeline。平台会固定网页内容尺寸，结束后恢复。</p><Button disabled={busy} onClick={() => void act(() => window.workspace.beginRecording({ id: draft.id }))}>已准备好，开始录制</Button>{draft.existingWorkflow ? <Button variant="outline" className="ml-3" disabled={busy} onClick={() => void act(async () => { await window.workspace.confirmChromeSession({ id: draft.id }); done(); })}>登录完成，返回用例运行</Button> : null}</CardContent></Card> : null}
+    {!preparing ? <div className="grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
       <Card className="min-w-0 gap-0 overflow-hidden py-0">
         <form className="flex items-center gap-2 border-b p-3" onSubmit={(e) => { e.preventDefault(); void interact({ actionType: 'Navigate', url }); }}>
           <Globe2 className="size-4 shrink-0 text-muted-foreground" />
           <Input aria-label="录制网页地址" className="min-w-0 flex-1" type="url" required value={url} onChange={(e) => setUrl(e.target.value)} disabled={!active || busy} />
           <Button type="submit" variant="outline" disabled={!active || busy}>打开</Button>
         </form>
-        <div className="relative aspect-[1280/800] w-full overflow-hidden bg-muted">
-          {active && frame?.previewUrl ? <iframe ref={preview} title="Midscene 官方录制预览" src={frame.previewUrl} className="h-full w-full border-0" sandbox="allow-scripts allow-same-origin" /> : frame ? <img className="block h-full w-full object-contain" src={frame.screenshot.startsWith('data:') ? frame.screenshot : `data:image/png;base64,${frame.screenshot}`} alt="录制网页预览" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground"><LoaderCircle className="size-7 animate-spin" /><p>正在准备官方录制界面</p></div>}
+        <div className="relative w-full overflow-hidden bg-muted" style={{ aspectRatio: `${frame?.width ?? 1280}/${frame?.height ?? 800}` }}>
+          {active && frame?.previewUrl ? <iframe ref={preview} title="Midscene 官方录制预览" src={frame.previewUrl} className="h-full w-full border-0" sandbox="allow-scripts allow-same-origin" /> : frame ? <img className="block h-full w-full object-contain" src={frame.screenshot.startsWith('data:') ? frame.screenshot : `data:image/png;base64,${frame.screenshot}`} alt="录制网页预览" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">{starting || active ? <><LoaderCircle className="size-7 animate-spin" /><p>{starting && draft.browserMode === 'bridge' ? '正在连接 Chrome…' : '正在准备官方录制界面'}</p></> : <p>{disconnected ? 'Chrome 连接未完成，请重新连接后开始录制。' : '暂无录制画面，请查看已保留的事件。'}</p>}</div>}
         </div>
         <Separator />
-        <p className="flex flex-wrap justify-between gap-2 px-3 py-3 text-xs text-muted-foreground"><span className="min-w-0 break-all">{frame?.url || draft.baseUrl}</span><span className="shrink-0">1280 × 800 · 单页面录制</span></p>
+        <p className="flex flex-wrap justify-between gap-2 px-3 py-3 text-xs text-muted-foreground"><span className="min-w-0 break-all">{frame?.url || draft.baseUrl}</span><span className="shrink-0">{frame?.width ?? 1280} × {frame?.height ?? 800} · {draft.browserMode === 'bridge' ? 'Chrome 现有会话' : '独立会话'} · 单页面录制</span></p>
       </Card>
       <Card className="min-w-0 gap-0 overflow-hidden py-0">
         <CardHeader className="flex flex-row items-center justify-between border-b px-5 py-4"><CardTitle className="text-base">Timeline</CardTitle><Badge variant="secondary">{events.length} 条事件</Badge></CardHeader>
@@ -129,21 +135,25 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
           const semantic = event.semantic;
           const screenshot = event.screenshotAsset || event.screenshotBefore || event.screenshotAfter || event.screenshotWithBox;
           const pending = semantic?.status === 'pending';
+          const verified = isRecordingDescriptionVerified(event);
+          const needsConfirmation = !verified || selected.prompt?.trim() !== semantic?.replayInstruction?.trim();
           return <div data-recorder-event={event.hashId} data-action-type={event.actionType} className={`space-y-3 border-b px-5 py-4 last:border-b-0 ${!navigation && selected.mode === 'skip' ? 'opacity-45' : ''}`} key={event.hashId}>
             <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>{event.actionType === 'Navigate' ? '导航' : eventNames[event.type]}</span><time>{Math.max(0, (event.timestamp - Date.parse(draft.createdAt)) / 1000).toFixed(1)}s</time></div>
             <div className="flex items-start gap-3"><span className="pt-0.5 font-mono text-xs text-muted-foreground">{String(index + 1).padStart(2, '0')}</span><strong className="min-w-0 break-words text-sm font-medium">{label(event)}</strong></div>
             {event.type === 'input' ? <p className="whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-xs">{event.rawPayload?.mode === 'clear' ? '清空输入框' : String(event.rawPayload?.value ?? event.value ?? '')}</p> : null}
             {event.rawPayload?.implicitNavigationState ? <p className="break-all text-xs leading-5 text-muted-foreground">{String(event.rawPayload.beforeUrl ?? '')} → {String(event.rawPayload.afterUrl ?? event.url ?? '')}</p> : null}
             <div className="flex flex-wrap items-center gap-2">
-              {pending ? <Badge variant="secondary"><LoaderCircle className="size-3 animate-spin" />正在生成描述</Badge> : semantic?.status === 'ready' && semantic.source !== 'heuristic' ? <Badge variant="secondary">{semantic.confidence === 'low' || semantic.aiDescribe?.verifyPassed === false ? 'AI 描述 · 请确认' : 'AI 描述'}</Badge> : !navigation && event.actionType !== 'Navigate' && semantic?.status === 'failed' ? <Badge variant="outline" title={semantic.error}>描述不可用</Badge> : null}
+              {pending ? <Badge variant="secondary"><LoaderCircle className="size-3 animate-spin" />正在生成并校验描述</Badge> : verified ? <Badge variant="secondary">AI 描述 · 已校验</Badge> : !navigation && event.actionType !== 'Navigate' ? <Badge variant="outline" title={semantic?.error}>描述待确认</Badge> : null}
               {screenshot ? <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" aria-label={`查看第 ${index + 1} 条事件截图`} onClick={() => setSelectedEvent(event)}><ImageIcon className="size-3.5" />截图</Button> : null}
             </div>
             {navigation ? <p className="text-xs text-muted-foreground">{event.actionType === 'InitialNavigation' ? '回放时使用所选环境的地址。' : '由页面产生的导航记录，不重复执行跳转。'}</p> : null}
             {!active && !starting && !navigation ? <>
-              <NativeSelect className="w-full" aria-label={`第 ${stepNumber} 步执行方式`} value={selected.mode} onChange={(e) => changeChoice(event.hashId, { mode: e.target.value as RecordingStepChoice['mode'], ...(e.target.value === 'ai' && !selected.prompt ? { prompt: semantic?.replayInstruction ?? '' } : {}) })}>
+              <NativeSelect className="w-full" aria-label={`第 ${stepNumber} 步执行方式`} value={selected.mode} onChange={(e) => changeChoice(event.hashId, { mode: e.target.value as RecordingStepChoice['mode'], ...(e.target.value === 'ai' && !selected.prompt ? { prompt: verified ? semantic?.replayInstruction ?? '' : '' } : {}) })}>
                 <NativeSelectOption value="recorded">按录制操作回放</NativeSelectOption><NativeSelectOption value="ai">AI 描述执行</NativeSelectOption><NativeSelectOption value="skip">排除此步骤</NativeSelectOption>
               </NativeSelect>
-              {selected.mode === 'ai' ? <Textarea aria-label={`第 ${stepNumber} 步 AI 描述`} rows={2} placeholder="例如：点击聊天输入框" value={selected.prompt ?? ''} onChange={(e) => changeChoice(event.hashId, { prompt: e.target.value })} /> : null}
+              {selected.mode === 'ai' ? <><Textarea aria-label={`第 ${stepNumber} 步 AI 描述`} rows={2} placeholder="例如：点击聊天输入框" value={selected.prompt ?? ''} onChange={(e) => changeChoice(event.hashId, { prompt: e.target.value })} />
+                {needsConfirmation ? <label className="flex items-start gap-2 text-xs leading-5"><input type="checkbox" className="mt-1" disabled={!selected.prompt?.trim()} checked={!!selected.prompt?.trim() && selected.confirmedPrompt === selected.prompt.trim()} onChange={(e) => changeChoice(event.hashId, { confirmedPrompt: e.target.checked ? selected.prompt?.trim() : undefined })} />我已对照截图确认此描述对应录制操作</label> : null}
+              </> : null}
             </> : null}
             <details className="text-xs text-muted-foreground"><summary className="cursor-pointer">事件详情</summary><div className="space-y-2 pt-2">
               {semantic?.error ? <p className="break-words">{semantic.error}</p> : null}
@@ -156,8 +166,8 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
           </div>;
         }) : <p className="px-5 py-8 text-sm leading-6 text-muted-foreground">{active ? '点击网页、输入文字或滚动后，步骤会显示在这里。' : '尚未采集操作。至少录制一个操作后才能保存。'}</p>}</CardContent>
       </Card>
-    </div>
-    {!active && !starting ? <Card>
+    </div> : null}
+    {!active && !starting && !preparing && actions.length > 0 ? <Card>
       <CardHeader className="flex flex-row items-center justify-between gap-3"><CardTitle className="text-base">预期结果</CardTitle><Button type="button" variant="outline" size="sm" onClick={() => { setAssertions([...assertions, { kind: 'text', text: '' }]); setYaml(''); }}><Plus className="size-3.5" />添加断言</Button></CardHeader>
       <CardContent className="space-y-3">
         {assertions.length ? assertions.map((assertion, index) => <div className="flex flex-wrap items-center gap-3" key={index}>
@@ -178,9 +188,9 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
         <Button type="button" variant="destructive" disabled={busy || starting} onClick={() => void act(async () => { await window.workspace.discardRecording({ id: draft.id }); done(); })}>确认放弃</Button>
         <Button type="button" variant="outline" onClick={() => setConfirmDiscard(false)}>保留草稿</Button>
       </> : <Button type="button" variant="outline" disabled={busy || starting} onClick={() => setConfirmDiscard(true)}>放弃本次录制</Button>}</div>
-      <div className="flex flex-wrap items-center gap-2">{active ? <Button type="button" variant="destructive" disabled={busy} onClick={() => void act(async () => { await flushPreview(); await window.workspace.stopRecording({ id: draft.id }); })}><Square className="size-3.5" />停止录制并检查</Button> : !starting ? <>
-        <Button type="button" variant="outline" disabled={busy} onClick={() => void act(async () => { setYaml(await window.workspace.buildRecording({ id: draft.id, choices, assertions })); })}><Code2 className="size-4" />预览 YAML</Button>
-        <Button type="button" disabled={busy} onClick={() => void act(async () => { await window.workspace.saveRecording({ id: draft.id, choices, assertions }); done(); })}><Check className="size-4" />保存到当前用例</Button>
+      <div className="flex flex-wrap items-center gap-2">{active ? <Button type="button" variant="destructive" disabled={busy} onClick={() => void act(async () => { await flushPreview(); await window.workspace.stopRecording({ id: draft.id }); })}><Square className="size-3.5" />停止录制并检查</Button> : !starting && !preparing ? <>
+        <Button type="button" variant="outline" disabled={busy || !hasReplayActions} onClick={() => void act(async () => { setYaml(await window.workspace.buildRecording({ id: draft.id, choices, assertions })); })}><Code2 className="size-4" />预览 YAML</Button>
+        <Button type="button" disabled={busy || !hasReplayActions} onClick={() => void act(async () => { await window.workspace.saveRecording({ id: draft.id, choices, assertions }); done(); })}><Check className="size-4" />保存到当前用例</Button>
       </> : null}</div>
     </div>
   </div>;

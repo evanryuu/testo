@@ -7,14 +7,14 @@ import { z } from 'zod/v4';
 import type { RecordingDraft, RecordingFrame, RecordingInteraction, RecordingResponse } from '../shared/recording.js';
 
 const interactionSchema = z.discriminatedUnion('actionType', [
-  z.object({ actionType: z.literal('Tap'), x: z.number().min(0).max(1279), y: z.number().min(0).max(799) }).strict(),
-  z.object({ actionType: z.literal('Input'), value: z.string().max(10_000), mode: z.enum(['typeOnly', 'replace', 'clear']).optional(), x: z.number().min(0).max(1279).optional(), y: z.number().min(0).max(799).optional() }).strict(),
+  z.object({ actionType: z.literal('Tap'), x: z.number().min(0).max(16383), y: z.number().min(0).max(16383) }).strict(),
+  z.object({ actionType: z.literal('Input'), value: z.string().max(10_000), mode: z.enum(['typeOnly', 'replace', 'clear']).optional(), x: z.number().min(0).max(16383).optional(), y: z.number().min(0).max(16383).optional() }).strict(),
   z.object({ actionType: z.literal('KeyboardPress'), keyName: z.enum(['Enter', 'Tab', 'Backspace', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) }).strict(),
   z.object({ actionType: z.literal('Scroll'), direction: z.enum(['up', 'down']), distance: z.number().min(1).max(2000) }).strict(),
   z.object({ actionType: z.literal('Navigate'), url: z.string().url().refine((v) => /^https?:/.test(v), '地址必须使用 HTTP 或 HTTPS') }).strict(),
 ]);
 
-type Update = { events: RecordingDraft['events']; frame: RecordingFrame; preview?: { url: string; token: string } };
+type Update = { events: RecordingDraft['events']; frame?: RecordingFrame; chromeTarget?: RecordingDraft['chromeTarget']; viewport?: RecordingDraft['viewport']; startUrl?: string; preview?: { url: string; token: string } };
 export class RecordingService {
   draft?: RecordingDraft;
   private child?: ChildProcess;
@@ -28,19 +28,20 @@ export class RecordingService {
   private file: string;
   private frameFile: string;
   private polling?: Promise<RecordingFrame>;
+  private retrying = false;
   constructor(private dataDir: string, private changed: () => void) {
     this.file = path.join(dataDir, 'recording-draft.json');
     this.frameFile = path.join(dataDir, 'recording-preview.json');
     if (existsSync(this.file)) {
       this.draft = JSON.parse(readFileSync(this.file, 'utf8')) ?? undefined;
-      if (this.draft?.status === 'recording' || this.draft?.status === 'starting') {
+      if (this.draft?.status === 'ready' || this.draft?.status === 'recording' || this.draft?.status === 'starting') {
         this.draft.status = 'interrupted'; this.draft.error = '上次录制已中断，已采集的步骤仍可检查和保存。'; this.persist();
       }
       if (existsSync(this.frameFile)) this.lastFrame = JSON.parse(readFileSync(this.frameFile, 'utf8'));
       this.interruptDescriptions();
     }
   }
-  get active() { return !!this.child && !!this.draft && ['starting', 'recording'].includes(this.draft.status); }
+  get active() { return !!this.child && !!this.draft && ['starting', 'ready', 'recording'].includes(this.draft.status); }
   private interruptDescriptions() {
     if (!this.draft) return;
     let changed = false;
@@ -65,9 +66,11 @@ export class RecordingService {
     if (!this.draft) return;
     if (update.preview) this.preview = update.preview;
     this.draft.events = update.events;
-    this.lastFrame = update.frame;
+    if (update.chromeTarget) this.draft.chromeTarget = update.chromeTarget;
+    if (update.viewport) this.draft.viewport = update.viewport;
+    if (update.startUrl) this.draft.startUrl = update.startUrl;
+    if (update.frame) { this.lastFrame = update.frame; writeFileSync(this.frameFile, JSON.stringify(update.frame), { mode: 0o600 }); }
     this.persist();
-    writeFileSync(this.frameFile, JSON.stringify(update.frame), { mode: 0o600 });
     this.changed();
   }
   private killBrowser() {
@@ -76,7 +79,7 @@ export class RecordingService {
       this.browserPid = undefined;
     }
   }
-  private rpc(method: 'start' | 'frame' | 'interact' | 'stop', input?: unknown): Promise<Update> {
+  private rpc(method: 'start' | 'begin' | 'confirm' | 'frame' | 'interact' | 'stop', input?: unknown): Promise<Update> {
     const child = this.child;
     if (!child?.connected) return Promise.reject(new Error('录制进程未连接'));
     const requestId = randomUUID();
@@ -101,7 +104,33 @@ export class RecordingService {
     writeFileSync(this.frameFile, 'null', { mode: 0o600 });
     this.draft = { ...input, id: randomUUID(), status: 'starting', events: [], createdAt: new Date().toISOString() };
     this.persist(); this.changed();
-    const runDir = path.join(this.dataDir, 'recordings', this.draft.id);
+    return this.launchWorker(environment);
+  }
+  async retry(id: string, environment: NodeJS.ProcessEnv = process.env) {
+    const draft = this.require(id);
+    if (this.retrying || draft.status === 'starting') throw new Error('正在重新连接 Chrome，请稍候');
+    if (draft.browserMode !== 'bridge') throw new Error('只有 Chrome 现有会话支持重新连接');
+    if (draft.events.length) throw new Error('已经采集录制事件，请先检查并保存，或放弃当前草稿后重新录制');
+    if (!['interrupted', 'ready'].includes(draft.status)) throw new Error('当前录制状态不支持重新连接');
+    this.retrying = true;
+    draft.status = 'starting'; draft.error = undefined; this.persist(); this.changed();
+    try {
+      await this.closeWorker();
+      // A late worker response must never be overwritten by a fresh recording.
+      if (draft.events.length) throw new Error('已经采集录制事件，请先检查并保存，或放弃当前草稿后重新录制');
+      this.lastFrame = undefined; this.preview = undefined; this.polling = undefined;
+      writeFileSync(this.frameFile, 'null', { mode: 0o600 });
+      draft.chromeTarget = undefined; draft.startUrl = undefined; draft.viewport = undefined;
+      draft.status = 'starting'; draft.error = undefined; this.persist(); this.changed();
+      return await this.launchWorker(environment);
+    } catch (error) {
+      draft.status = 'interrupted'; draft.error = error instanceof Error ? error.message : String(error);
+      this.persist(); this.changed(); throw error;
+    } finally { this.retrying = false; }
+  }
+  private async launchWorker(environment: NodeJS.ProcessEnv) {
+    const draft = this.draft!;
+    const runDir = path.join(this.dataDir, 'recordings', draft.id);
     mkdirSync(runDir, { recursive: true, mode: 0o700 });
     const child = fork(fileURLToPath(new URL('../recording/worker.js', import.meta.url)), [], {
       cwd: runDir, execArgv: [], stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -116,7 +145,7 @@ export class RecordingService {
         if (message.type === 'events' && this.child === child && this.draft) {
           this.draft.events = message.events; this.persist(); this.changed();
         }
-        if (message.type === 'browser') this.browserPid = message.pid;
+        if (message.type === 'browser' && this.child === child) this.browserPid = message.pid;
         if (message.type === 'ready') { clearTimeout(readyTimer); readyResolve(); }
         return;
       }
@@ -128,24 +157,51 @@ export class RecordingService {
     child.on('error', () => { child.kill(); });
     child.on('close', () => {
       clearTimeout(readyTimer); readyReject(new Error('录制进程已退出'));
+      if (this.child !== child) return;
       this.killBrowser();
       for (const request of this.pending.values()) { clearTimeout(request.timer); request.reject(new Error('录制进程已退出')); }
       this.pending.clear(); this.child = undefined; this.preview = undefined;
       this.interruptDescriptions();
-      if (this.draft && ['recording', 'starting'].includes(this.draft.status)) {
+      if (this.draft && ['recording', 'ready', 'starting'].includes(this.draft.status)) {
         this.draft.status = 'interrupted'; this.draft.error = '录制进程已退出，已采集的步骤仍保留。'; this.persist();
       }
       this.changed();
     });
     try {
       await ready;
-      this.accept(await this.rpc('start', { id: this.draft.id, baseUrl: input.baseUrl }));
-      this.draft.status = 'recording'; this.persist(); this.changed();
-      return this.draft.id;
+      this.accept(await this.rpc('start', { id: draft.id, baseUrl: draft.baseUrl, browserMode: draft.browserMode }));
+      draft.status = draft.browserMode === 'bridge' ? 'ready' : 'recording'; this.persist(); this.changed();
+      return draft.id;
     } catch (error) {
-      this.draft.status = 'interrupted'; this.draft.error = String(error); this.persist(); this.changed();
+      draft.status = 'interrupted'; draft.error = error instanceof Error ? error.message : String(error); this.persist(); this.changed();
+      await this.closeWorker();
       throw error;
     }
+  }
+  async begin(id: string) {
+    this.require(id);
+    if (this.draft!.status !== 'ready') throw new Error('当前会话不在登录准备阶段');
+    try {
+      this.accept(await this.rpc('begin'));
+      this.draft!.status = 'recording'; this.persist(); this.changed();
+    } catch (error) { await this.preparationFailed(error); throw error; }
+  }
+  async confirm(id: string) {
+    this.require(id);
+    if (this.draft!.status !== 'ready' || !this.draft!.existingWorkflow) throw new Error('请先连接 Chrome，并确认当前用例已有 Workflow');
+    try {
+      this.accept(await this.rpc('confirm'));
+      this.draft!.status = 'saved'; this.persist(); this.changed();
+      await this.closeWorker();
+    } catch (error) { await this.preparationFailed(error); throw error; }
+  }
+  private async preparationFailed(error: unknown) {
+    this.draft!.status = 'interrupted'; this.draft!.error = error instanceof Error ? error.message : String(error);
+    this.persist(); this.changed(); await this.closeWorker();
+  }
+  async release() {
+    if (this.active) throw new Error('请先停止录制');
+    await this.closeWorker();
   }
   async frame(id: string): Promise<RecordingFrame> {
     this.require(id);
@@ -153,7 +209,7 @@ export class RecordingService {
       if (!this.lastFrame) throw new Error('暂无录制画面');
       return this.lastFrame;
     }
-    if (!this.polling) this.polling = this.rpc('frame').then((update) => { this.accept(update); return update.frame; }).finally(() => { this.polling = undefined; });
+    if (!this.polling) this.polling = this.rpc('frame').then((update) => { this.accept(update); return update.frame!; }).finally(() => { this.polling = undefined; });
     const frame = await this.polling;
     return { ...frame, previewUrl: this.preview?.url };
   }

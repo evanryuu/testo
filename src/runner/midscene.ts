@@ -3,9 +3,15 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { collectWorkflowDocument, NodeRegistry, runWorkflowDocument, type WorkflowDocumentExecutionResult } from '@midscene/test';
 import { createMidsceneNodes } from '@midscene/test/midscene';
-import { createPlaywrightNodes } from '@midscene/test/playwright';
+import { z } from 'zod/v4';
+import { createPlaywrightNodes, gotoUrlInputSchema } from '@midscene/test/playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { chromium, type Browser, type BrowserServer, type Page } from 'playwright';
+import { createChromeBridge, connectChrome, pinChromeViewport } from '../recording/chrome-bridge.js';
+import { createBridgeNodes } from './bridge-nodes.js';
+import { waitForStableViewport } from '../recording/viewport.js';
+import { captureActionEvidence } from './evidence.js';
+import { describeRunStep } from '../shared/run-steps.js';
 import { createRecordedNodes } from './recorded-nodes.js';
 import { RECORDING_VIEWPORT } from '../recording/workflow.js';
 import type { RunOptions, WorkerEvent } from './messages.js';
@@ -16,6 +22,7 @@ export async function executeWorkflow(
   signal: AbortSignal,
   emit: (event: WorkerEvent) => void,
 ): Promise<Extract<WorkerEvent, { type: 'finished' }>> {
+  let bridgeAgent: ReturnType<typeof createChromeBridge> | undefined;
   let server: BrowserServer | undefined;
   let browser: Browser | undefined;
   let page: Page | undefined;
@@ -50,6 +57,10 @@ export async function executeWorkflow(
       return page;
     };
     const getAgent = (id: string) => {
+      if (options.chromeTarget) {
+        if (!bridgeAgent) throw new Error('Chrome 尚未连接');
+        return bridgeAgent;
+      }
       let agent = agents.get(id);
       if (!agent) {
         agent = new PlaywrightAgent(getPage(), {
@@ -64,13 +75,23 @@ export async function executeWorkflow(
       return agent;
     };
     const registry = new NodeRegistry([
-      ...createRecordedNodes({ getPage, getAgent: (ctx) => getAgent(ctx.scope === 'case' ? ctx.case.runId : ctx.document.documentRunId) }),
-      ...createPlaywrightNodes({ getPage, getBaseUrl: () => options.baseUrl }),
+      ...createRecordedNodes({ ...(options.chromeTarget ? { prepareViewport: (size, signal) => pinChromeViewport(bridgeAgent!, size, signal) } : { getPage }), onAction: async (ctx, agent, stage) => {
+        const step = ctx.scope === 'case' ? ctx.case : ctx.document;
+        emit(await captureActionEvidence(agent, options.chromeTarget ? undefined : getPage, artifactDirectory, ctx.input, step.phase, step.stepIndex, stage));
+      }, getAgent: (ctx) => getAgent(ctx.scope === 'case' ? ctx.case.runId : ctx.document.documentRunId) }),
+      ...(options.chromeTarget ? createBridgeNodes(() => { if (!bridgeAgent) throw new Error('Chrome 尚未连接'); return bridgeAgent; }, options.baseUrl) : createPlaywrightNodes({ getPage, getBaseUrl: () => options.baseUrl }).map(node => node.name === 'gotoUrl' ? { ...node, inputSchema: gotoUrlInputSchema.extend({ timeoutMs: z.number().positive().default(20000) }) } : node)).map(node => node.name !== 'gotoUrl' ? node : {
+        ...node,
+        async execute(ctx: any) {
+          const result = await node.execute(ctx);
+          await waitForStableViewport(() => options.chromeTarget ? bridgeAgent!.interface.size() : getPage().evaluate(() => ({ width: innerWidth, height: innerHeight })), { signal: ctx.signal });
+          return result;
+        },
+      }),
       ...createMidsceneNodes({
         agentClass: PlaywrightAgent,
         agentProvider: {
           getAgent,
-          releaseAgent,
+          releaseAgent: options.chromeTarget ? undefined : releaseAgent,
         },
       }),
     ]);
@@ -87,7 +108,26 @@ export async function executeWorkflow(
     if (document.cases.length !== 1) {
       throw new Error('V0 requires exactly one Case in each platform Workflow');
     }
+    // Keep explicit per-step limits; otherwise allow navigation to report its own
+    // timeout and finish cleanup before the workflow deadline fires.
+    for (const step of [...Object.values(document.lifecycle).flat(), ...document.cases.flatMap(item => item.definition.steps)]) {
+      if (step.node === 'gotoUrl' && step.meta.timeoutMs === undefined) {
+        step.meta.timeoutMs = (typeof step.input.timeoutMs === 'number' ? step.input.timeoutMs : 20000) + 7000;
+      }
+    }
+    emit({ type: 'steps-planned', steps: [
+      ...document.lifecycle.beforeAll.map((step, index) => describeRunStep(step.node, step.input, 'beforeAll', index)),
+      ...document.lifecycle.beforeEach.map((step, index) => describeRunStep(step.node, step.input, 'beforeEach', index)),
+      ...document.cases[0]!.definition.steps.map((step, index) => describeRunStep(step.node, step.input, 'steps', index)),
+      ...document.lifecycle.afterEach.map((step, index) => describeRunStep(step.node, step.input, 'afterEach', index)),
+      ...document.lifecycle.afterAll.map((step, index) => describeRunStep(step.node, step.input, 'afterAll', index)),
+    ] });
     signal.throwIfAborted();
+    if (options.chromeTarget) {
+      bridgeAgent = createChromeBridge('chrome-session');
+      await connectChrome(bridgeAgent, new URL(options.baseUrl).origin, options.chromeTarget);
+      await waitForStableViewport(() => bridgeAgent!.interface.size(), { signal });
+    } else {
     server = await chromium.launchServer({
       host: '127.0.0.1',
       headless: options.headless ?? true,
@@ -101,6 +141,7 @@ export async function executeWorkflow(
     browser = await chromium.connect(server.wsEndpoint());
     const context = await browser.newContext({ viewport: RECORDING_VIEWPORT });
     page = await context.newPage();
+    }
     signal.throwIfAborted();
     outcome = await runWorkflowDocument(document, {
       resolveNode: (name) => registry.require(name),
@@ -126,6 +167,10 @@ export async function executeWorkflow(
     executionFailed = true;
     errors.push(error instanceof Error ? error.message : String(error));
   } finally {
+    if (bridgeAgent) {
+      try { await bridgeAgent.destroy(); if (bridgeAgent.reportFile) reportPaths.add(bridgeAgent.reportFile); }
+      catch (error) { cleanupFailed = true; errors.push(`Chrome 断开连接失败：${String(error)}`); }
+    }
     for (const id of agents.keys()) {
       try { await releaseAgent(id); }
       catch (error) { cleanupFailed = true; errors.push(`Report cleanup failed: ${String(error)}`); }

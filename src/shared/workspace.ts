@@ -31,11 +31,16 @@ export interface DesktopApi {
   importFile(): Promise<string | null>;
   saveWorkflow(input: { projectId: string; caseId: string; workflowId: string; text: string; revision: string }): Promise<void>;
   saveEnvironment(input: { projectId: string; id?: string; name: string; baseUrl: string }): Promise<void>;
-  run(input: { projectId: string; caseId: string; workflowId: string; environmentId: string }): Promise<string>;
+  run(input: { projectId: string; caseId: string; workflowId: string; environmentId: string; browserMode?: 'isolated' | 'bridge' }): Promise<string>;
   cancelRun(): Promise<void>;
+  runPlan(input: { runId: string }): Promise<import('./run-steps.js').RunStepInfo[]>;
+  runScreenshot(input: { runId: string; image: string }): Promise<string>;
+  retryRecording(input: { id: string }): Promise<void>;
   openReport(input: { runId: string }): Promise<void>;
   saveModel(input: { name: string; baseUrl: string; family: string; apiKey: string }): Promise<void>;
-  startRecording(input: { projectId: string; caseId: string; workflowId: string; environmentId: string }): Promise<string>;
+  startRecording(input: { projectId: string; caseId: string; workflowId: string; environmentId: string; browserMode?: 'isolated' | 'bridge' }): Promise<string>;
+  confirmChromeSession(input: { id: string }): Promise<void>;
+  beginRecording(input: { id: string }): Promise<void>;
   recordingFrame(input: { id: string }): Promise<RecordingFrame>;
   recordingScreenshot(input: { id: string; hashId: string }): Promise<string>;
   recordingInteract(input: { id: string; action: RecordingInteraction }): Promise<void>;

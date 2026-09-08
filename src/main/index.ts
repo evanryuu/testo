@@ -9,8 +9,11 @@ import { createPlaywrightNodes } from '@midscene/test/playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { WorkspaceStore } from './workspace.js';
 import { RecordingService } from './recording.js';
+import type { ChromeTarget } from '../recording/chrome-bridge.js';
 import { buildRecordedWorkflow } from '../recording/workflow.js';
 import { createRecordedNodes } from '../runner/recorded-nodes.js';
+import { parse } from 'yaml';
+import { runPlanFromYaml } from '../shared/run-steps.js';
 import { HistoryStore } from './history.js';
 import { startRun, type RunHandle } from '../runner/run.js';
 import type { HistoryRun, ModelSettings } from '../shared/workspace.js';
@@ -36,6 +39,9 @@ const modelSettings = (): ModelSettings => {
 const change = () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('workspace:changed'); };
 
 const recorder = new RecordingService(dataDir, change);
+// Bindings live only for this app session; no cookies or Chrome profile are copied.
+const chromeTargets = new Map<string, ChromeTarget>();
+const chromeKey = (i: { projectId: string; caseId: string; workflowId: string; environmentId: string }) => JSON.stringify([i.projectId, i.caseId, i.workflowId, i.environmentId]);
 
 function modelEnvironment(): NodeJS.ProcessEnv {
   const m = modelData();
@@ -84,7 +90,7 @@ const handlers: Record<string, (input: any) => unknown> = {
     store.saveWorkflow(i);
   },
   saveEnvironment: (i) => store.saveEnvironment(i),
-  run: (i) => {
+  run: async (i) => {
     if (active) throw new Error('已有测试正在运行，请等待完成或先取消');
     if (recorder.active) throw new Error('请先停止录制，再运行测试');
     const { project, item } = store.caseLocation(i.projectId, i.caseId);
@@ -92,8 +98,12 @@ const handlers: Record<string, (input: any) => unknown> = {
     if (platform !== 'web') throw new Error('当前版本只支持执行 Web Workflow');
     const environment = project.environments.find((e) => e.id === i.environmentId);
     if (!environment) throw new Error('请选择运行环境');
+    const chromeTarget = i.browserMode === 'bridge' ? chromeTargets.get(chromeKey(i)) : undefined;
+    if (i.browserMode === 'bridge' && !chromeTarget) throw new Error('请先为此用例和环境连接 Chrome 并确认登录；应用重启后需要重新连接');
+    await recorder.release();
+    if (active || recorder.active) throw new Error('已有录制或运行正在进行');
     const environmentVariables = modelEnvironment();
-    const run = startRun({ workflowPath: file, baseUrl: environment.web.baseUrl, artifactRoot: path.join(dataDir, 'artifacts'), channel: 'chrome', headless: false }, (event) => {
+    const run = startRun({ workflowPath: file, baseUrl: environment.web.baseUrl, artifactRoot: path.join(dataDir, 'artifacts'), channel: 'chrome', headless: false, chromeTarget }, (event) => {
       record.events.push(event);
       history.save(record);
       change();
@@ -114,7 +124,21 @@ const handlers: Record<string, (input: any) => unknown> = {
     if (platform !== 'web') throw new Error('当前只支持 Web 录制');
     const environment = project.environments.find((e) => e.id === i.environmentId);
     if (!environment) throw new Error('请选择录制环境');
-    return recorder.start({ projectId: project.id, caseId: item.id, workflowId: i.workflowId, caseName: item.name, environmentId: environment.id, baseUrl: environment.web.baseUrl, revision: store.workflow(i.projectId, i.caseId, i.workflowId).revision }, modelEnvironment());
+    return recorder.start({ projectId: project.id, caseId: item.id, workflowId: i.workflowId, caseName: item.name, environmentId: environment.id, baseUrl: environment.web.baseUrl, revision: store.workflow(i.projectId, i.caseId, i.workflowId).revision, browserMode: i.browserMode === 'bridge' ? 'bridge' : 'isolated', existingWorkflow: existsSync(store.workflowLocation(i.projectId, i.caseId, i.workflowId).file) }, modelEnvironment());
+  },
+  retryRecording: async (i) => {
+    if (active) throw new Error('请先等待测试结束，再重试连接');
+    await recorder.retry(i.id, modelEnvironment());
+  },
+  confirmChromeSession: async (i) => {
+    await recorder.confirm(i.id);
+    const draft = recorder.require(i.id);
+    if (draft.chromeTarget) chromeTargets.set(chromeKey(draft), draft.chromeTarget);
+  },
+  beginRecording: async (i) => {
+    await recorder.begin(i.id);
+    const draft = recorder.require(i.id);
+    if (draft.chromeTarget) chromeTargets.set(chromeKey(draft), draft.chromeTarget);
   },
   recordingFrame: (i) => recorder.frame(i.id),
   recordingScreenshot: (i) => recorder.screenshot(i.id, i.hashId),
@@ -124,18 +148,37 @@ const handlers: Record<string, (input: any) => unknown> = {
   buildRecording: (i) => {
     const draft = recorder.require(i.id);
     if (recorder.active) throw new Error('请先停止录制');
-    return buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions });
+    return buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions, ...(draft.browserMode === 'bridge' ? { viewport: draft.viewport, startUrl: draft.startUrl } : {}) });
   },
   saveRecording: (i) => {
     const draft = recorder.require(i.id);
     if (recorder.active) throw new Error('请先停止录制');
     if (draft.status === 'saved') throw new Error('本次录制已经保存');
-    const text = buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions });
+    const text = buildRecordedWorkflow({ name: draft.caseName, events: draft.events, choices: i.choices, assertions: i.assertions, ...(draft.browserMode === 'bridge' ? { viewport: draft.viewport, startUrl: draft.startUrl } : {}) });
     validateWorkflow(text);
     store.saveWorkflow({ projectId: draft.projectId, caseId: draft.caseId, workflowId: draft.workflowId, revision: draft.revision, text });
     recorder.saved(i.id);
   },
   cancelRun: () => active?.cancel(),
+  runPlan: (i) => {
+    const run = history.list().find(r => r.runId === i.runId);
+    if (!run) throw new Error('运行记录不存在');
+    const planned = run.events.find(e => e.type === 'steps-planned');
+    if (planned?.type === 'steps-planned') return planned.steps;
+    if (!/^[a-zA-Z0-9-]+$/.test(i.runId)) throw new Error('无效运行记录');
+    const file = path.join(dataDir, 'artifacts', i.runId, 'workflow.yaml');
+    return existsSync(file) ? runPlanFromYaml(parse(readFileSync(file, 'utf8'))) : [];
+  },
+  runScreenshot: (i) => {
+    const run = history.list().find(r => r.runId === i.runId);
+    if (!run || !/^[a-zA-Z0-9-]+$/.test(i.runId) || !/^(steps|beforeAll|beforeEach|afterEach|afterAll)-\d+-(before|after|failed)\.(png|jpg)$/.test(i.image)) throw new Error('运行截图不存在');
+    if (!run.events.some(e => e.type === 'step-evidence' && e.image === i.image)) throw new Error('运行截图不属于本次运行');
+    const directory = realpathSync(path.join(dataDir, 'artifacts', i.runId, 'steps'));
+    const relative = path.relative(realpathSync(path.join(dataDir, 'artifacts')), directory);
+    const file = realpathSync(path.join(directory, i.image));
+    if (relative.startsWith('..') || path.isAbsolute(relative) || path.dirname(file) !== directory) throw new Error('无效截图路径');
+    return `data:image/${i.image.endsWith('.jpg') ? 'jpeg' : 'png'};base64,${readFileSync(file).toString('base64')}`;
+  },
   openReport: async (i) => {
     const report = history.list().find((r) => r.runId === i.runId)?.result?.reportPaths[0];
     if (!report || !existsSync(report)) throw new Error('本次运行没有可用报告');

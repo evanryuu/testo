@@ -1,4 +1,4 @@
-import type { RecordedEvent } from '../shared/recording.js';
+import { isRecordingDescriptionVerified, type RecordedEvent } from '../shared/recording.js';
 
 // The official endpoint returns raw events, including replacements with the same
 // hash. Description responses are separate and must not be overwritten by polling.
@@ -30,7 +30,7 @@ export class RecorderEvents {
       try { await this.options.persistScreenshot(stored); }
       catch { stored.screenshotError = '截图未能保存到本地'; }
       this.entries.set(event.hashId, stored);
-      if (!['navigation', 'setViewport'].includes(event.type) && event.actionType !== 'Navigate' && event.semantic?.status !== 'ready') {
+      if (!['navigation', 'setViewport'].includes(event.type) && event.actionType !== 'Navigate' && !isRecordingDescriptionVerified(event)) {
         if (event.screenshotAsset || event.screenshotBefore || event.screenshotAfter || event.screenshotWithBox) {
           stored.semantic = { ...event.semantic, source: event.semantic?.source ?? 'aiDescribe', status: 'pending' };
           this.jobs.push({ event: structuredClone(stored), version });

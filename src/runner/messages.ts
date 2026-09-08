@@ -1,5 +1,6 @@
 export interface RunOptions {
   workflowPath: string;
+  chromeTarget?: import('../recording/chrome-bridge.js').ChromeTarget;
   baseUrl: string;
   artifactRoot: string;
   channel?: string;
@@ -23,6 +24,8 @@ export interface RunResult {
 }
 
 export type WorkerEvent =
+  | { type: 'steps-planned'; steps: import('../shared/run-steps.js').RunStepInfo[] }
+  | { type: 'step-evidence'; phase: string; index: number; stage: 'before' | 'after' | 'failed'; image?: string; url?: string; target?: string; warning?: string }
   | { type: 'ready' }
   | { type: 'browser-started'; pid: number }
   | { type: 'browser-closed' }

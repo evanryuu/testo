@@ -1,9 +1,11 @@
+import { isRecordingDescriptionVerified, type RecordedEvent } from '../shared/recording.js';
 import { stringify } from 'yaml';
 import { z } from 'zod/v4';
 
 export const RECORDING_VIEWPORT = { width: 1280, height: 800 } as const;
 
 export interface RecorderEvent {
+  semantic?: RecordedEvent['semantic'];
   hashId: string;
   actionType?: string;
   type?: string;
@@ -12,16 +14,17 @@ export interface RecorderEvent {
   url?: string;
   value?: string;
 }
-export interface RecordingStepChoice { hashId: string; mode: 'recorded' | 'ai' | 'skip'; prompt?: string }
+export interface RecordingStepChoice { hashId: string; mode: 'recorded' | 'ai' | 'skip'; prompt?: string; confirmedPrompt?: string }
 export interface RecordingAssertion { kind: 'text' | 'ai'; text: string }
 
-const point = { x: z.number().finite().min(0).max(1279).optional(), y: z.number().finite().min(0).max(799).optional() };
+const point = { x: z.number().finite().min(0).max(16383).optional(), y: z.number().finite().min(0).max(16383).optional() };
 export const recordedActionSchema = z.object({
   actionType: z.enum(['Tap', 'Input', 'KeyboardPress', 'Scroll', 'DragAndDrop']),
+  viewport: z.object({ width: z.number().int().positive().max(16384), height: z.number().int().positive().max(16384) }).strict().optional(),
   payload: z.object({
     ...point,
-    endX: z.number().finite().min(0).max(1279).optional(),
-    endY: z.number().finite().min(0).max(799).optional(),
+    endX: z.number().finite().min(0).max(16383).optional(),
+    endY: z.number().finite().min(0).max(16383).optional(),
     value: z.string().optional(),
     mode: z.enum(['replace', 'clear', 'typeOnly']).optional(),
     keyName: z.string().min(1).optional(),
@@ -30,7 +33,11 @@ export const recordedActionSchema = z.object({
     distance: z.number().finite().nonnegative().optional(),
     autoDismissKeyboard: z.boolean().optional(),
   }).strict(),
-}).strict().superRefine(({ actionType, payload }, ctx) => {
+}).strict().superRefine(({ actionType, payload, viewport = RECORDING_VIEWPORT }, ctx) => {
+  for (const key of ['x', 'endX', 'y', 'endY'] as const) {
+    const value = payload[key];
+    if (value !== undefined && value >= (key.endsWith('X') || key === 'x' ? viewport.width : viewport.height)) ctx.addIssue({ code: 'custom', message: '操作坐标超出录制视口' });
+  }
   if ((payload.x === undefined) !== (payload.y === undefined)) ctx.addIssue({ code: 'custom', message: 'x 和 y 必须一起提供' });
   if (actionType === 'Tap' && payload.x === undefined) ctx.addIssue({ code: 'custom', message: 'Tap 缺少录制坐标' });
   if (actionType === 'DragAndDrop' && (payload.x === undefined || payload.endX === undefined || payload.endY === undefined)) ctx.addIssue({ code: 'custom', message: '拖动需要完整的起点和终点坐标' });
@@ -45,13 +52,16 @@ export function buildRecordedWorkflow(input: {
   events: RecorderEvent[];
   choices?: RecordingStepChoice[];
   assertions?: RecordingAssertion[];
+  viewport?: { width: number; height: number };
+  startUrl?: string;
 }): string {
   if (!input.name.trim()) throw new Error('用例名称不能为空');
   const choices = new Map((input.choices ?? []).map((choice) => [choice.hashId, choice]));
   if (choices.size !== (input.choices ?? []).length) throw new Error('录制步骤设置重复');
   const ids = new Set(input.events.map((event) => event.hashId));
   for (const id of choices.keys()) if (!ids.has(id)) throw new Error(`找不到录制步骤：${id}`);
-  const steps: Record<string, unknown>[] = [{ setViewportSize: RECORDING_VIEWPORT }, { gotoUrl: { url: '${baseUrl}' } }];
+  const viewport = input.viewport ?? RECORDING_VIEWPORT;
+  const steps: Record<string, unknown>[] = [];
   for (const event of input.events) {
     const payload = event.rawPayload ?? {};
     if (event.actionType === 'InitialNavigation' || (payload.implicitNavigationState === true && event.type === 'navigation')) continue;
@@ -59,22 +69,29 @@ export function buildRecordedWorkflow(input: {
     if (choice?.mode === 'skip') continue;
     const actionType = event.actionType;
     if (!['Tap', 'Input', 'KeyboardPress', 'Scroll', 'Navigate', 'DragAndDrop'].includes(actionType ?? '')) throw new Error(`暂不支持录制操作：${actionType ?? event.type ?? '未知'}，请删除该步骤后重新录制`);
-    if (event.pageInfo.width !== 1280 || event.pageInfo.height !== 800) throw new Error('录制视口必须为 1280 × 800，请重新录制');
     if (choice?.mode === 'ai') {
       if (!choice.prompt?.trim()) throw new Error('AI 步骤需要填写操作描述');
-      steps.push({ aiAct: choice.prompt.trim() });
+      const prompt = choice.prompt.trim();
+      if ((!isRecordingDescriptionVerified(event) || prompt !== event.semantic?.replayInstruction?.trim()) && choice.confirmedPrompt !== prompt) {
+        throw new Error('请检查并确认 AI 描述后再保存，或选择按录制操作回放');
+      }
+      steps.push({ aiAct: prompt });
     } else if (actionType === 'Navigate') {
       const url = payload.url;
       if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) throw new Error('录制导航缺少有效的 HTTP 地址');
       steps.push({ gotoUrl: { url } });
     } else {
+      if (event.pageInfo.width !== viewport.width || event.pageInfo.height !== viewport.height) throw new Error('坐标回放步骤的视口发生变化，请保持 Chrome 窗口尺寸后重新录制');
       // The official recorder already coalesces typeOnly input. Preserve its value and mode exactly.
       const { actionType: _actionType, ...parameters } = payload;
-      const action = recordedActionSchema.parse({ actionType, payload: parameters });
+      const action = recordedActionSchema.parse({ actionType, payload: parameters, ...(input.viewport ? { viewport } : {}) });
       steps.push({ recordedAction: action });
     }
   }
-  if (steps.length < 3) throw new Error('请至少录制一个操作');
+  if (!steps.length) throw new Error('请至少录制一个操作');
+  const needsViewport = steps.some(step => 'recordedAction' in step);
+  steps.unshift({ gotoUrl: { url: input.startUrl ?? '${baseUrl}' } });
+  if (needsViewport) steps.unshift(input.viewport ? { requireViewport: viewport } : { setViewportSize: viewport });
   for (const assertion of input.assertions ?? []) {
     if (!assertion.text.trim()) throw new Error('断言内容不能为空');
     if (assertion.kind === 'text') steps.push({ assertText: { text: assertion.text.trim() } });

@@ -138,6 +138,19 @@ test('record in Workspace, review, save YAML, replay the real form and recover a
     await page.screenshot({ path: path.join(root, 'artifacts/recording-replay.png') });
     const state = await page.evaluate(() => window.workspace.state());
     assert.ok(state.runs[0]!.result!.reportPaths.length > 0);
+    const sendStep = page.getByTestId('run-step').filter({ hasText: 'button · 发送' });
+    await expect(sendStep).toContainText('button · 发送');
+    await expect(sendStep).toContainText('操作调用完成；业务结果由后续断言确认');
+    await sendStep.getByRole('button', { name: '执行前截图', exact: true }).click();
+    await page.getByRole('img', { name: '运行步骤截图' }).waitFor();
+    await page.waitForFunction(() => (document.querySelector('[role="dialog"] img') as HTMLImageElement)?.naturalWidth > 0);
+    await expect(page.locator('svg[aria-label="原录制坐标"] circle')).toHaveAttribute('cx', '455');
+    await page.screenshot({ path: path.join(root, 'artifacts/run-step-evidence.png'), animations: 'disabled' });
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    const invalidImage = await page.evaluate(async (runId) => {
+      try { await window.workspace.runScreenshot({ runId, image: '../workflow.yaml' }); return ''; } catch (error) { return String(error); }
+    }, state.runs[0]!.runId);
+    assert.match(invalidImage, /截图不存在/);
     assert.match(readFileSync(path.join(state.projects[0]!.root, 'workspace.yaml'), 'utf8'), /录制 MVP/);
     await page.getByRole('button', { name: '返回用例再运行' }).click();
     await page.getByRole('button', { name: '开始录制', exact: true }).click();
@@ -150,6 +163,14 @@ test('record in Workspace, review, save YAML, replay the real form and recover a
     assert.ok((await page.evaluate(() => window.workspace.state())).recording!.events.some((e) => String(e.rawPayload?.value).includes('last input before stop')));
     await page.getByLabel('第 1 步执行方式', { exact: true }).selectOption('ai');
     await page.getByLabel('第 1 步 AI 描述', { exact: true }).fill('点击消息输入框');
+    await page.getByRole('button', { name: '预览 YAML', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: /确认 AI 描述/ }).waitFor();
+    await page.getByRole('checkbox', { name: '我已对照截图确认此描述对应录制操作' }).check();
+    await page.getByLabel('第 1 步 AI 描述', { exact: true }).fill('点击输入框');
+    await expect(page.getByRole('checkbox', { name: '我已对照截图确认此描述对应录制操作' })).not.toBeChecked();
+    await page.getByLabel('第 1 步 AI 描述', { exact: true }).fill('点击消息输入框');
+    await page.getByRole('checkbox', { name: '我已对照截图确认此描述对应录制操作' }).check();
+    await page.screenshot({ path: path.join(data, 'description-confirmation.png'), fullPage: true });
     await page.getByRole('button', { name: '添加断言', exact: true }).click();
     await page.getByLabel('断言 1 内容', { exact: true }).fill('草稿断言需要保留');
     const project = state.projects[0]!, item = project.cases[0]!;
@@ -184,4 +205,64 @@ test('record in Workspace, review, save YAML, replay the real form and recover a
     if (page && !page.isClosed()) { console.log((await page.locator('body').innerText()).slice(-6000)); await page.screenshot({ path: 'artifacts/recording-failure.png' }); }
     throw error;
   } finally { await application?.close(); server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+// A coordinate click can succeed while missing the button. Preserve this distinction
+// in the actual result page, including later steps that never ran.
+test('missed click evidence and unexecuted actions stay visible after restarting the app', { timeout: 60000 }, async () => {
+  const data = mkdtempSync(path.resolve('artifacts/run-evidence-ui-'));
+  let submissions = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/submit') { submissions++; res.end('ok'); return; }
+    res.setHeader('Content-Type', 'text/html');
+    res.end('<!doctype html><div style="position:absolute;left:20px;top:20px;width:200px;height:70px">Empty area</div><button style="position:absolute;top:200px;left:20px" onclick="fetch(\'/submit\');this.textContent=\'Sent\'">Send</button>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'ELECTRON_RUN_AS_NODE' && !e[0].startsWith('MIDSCENE_MODEL'))), WORKSPACE_DATA_DIR: path.join(data, 'app'), WORKSPACE_PROJECTS_DIR: path.join(data, 'projects') };
+  let app: ElectronApplication | undefined;
+  try {
+    app = await electron.launch({ args: [process.cwd()], env });
+    let ui = await app.firstWindow();
+    await ui.evaluate(async (baseUrl) => {
+      const projectId = await window.workspace.createProject({ name: '点击证据验证', description: '' });
+      let project = (await window.workspace.state()).projects.find(p => p.id === projectId)!;
+      const environmentId = project.environments[0]!.id;
+      await window.workspace.saveEnvironment({ projectId, id: environmentId, name: '本地', baseUrl });
+      const caseId = await window.workspace.createCase({ projectId, name: '点击未命中发送按钮', suiteId: project.suites[0]!.id, platforms: ['web'] });
+      project = (await window.workspace.state()).projects.find(p => p.id === projectId)!;
+      const refs = { projectId, caseId, workflowId: project.cases[0]!.workflows[0]!.id };
+      const saved = await window.workspace.workflow(refs);
+      await window.workspace.saveWorkflow({ ...refs, revision: saved.revision, text: 'cases:\n  - name: Missed click\n    steps:\n      - gotoUrl: "${baseUrl}"\n      - recordedAction:\n          actionType: Tap\n          payload: {x: 70, y: 40}\n      - assertText: {text: Sent, timeoutMs: 100}\n      - recordedAction:\n          actionType: Tap\n          payload: {x: 50, y: 220}\nafterEach:\n  - recordToReport: {}\n' });
+      await window.workspace.run({ ...refs, environmentId });
+    }, baseUrl);
+    await expect.poll(async () => (await ui.evaluate(() => window.workspace.state())).runs[0]?.status, { timeout: 30000 }).toBe('failed');
+    await ui.getByRole('button', { name: 'Run History', exact: true }).click();
+    await ui.getByTestId('run-row').first().click();
+    const missed = ui.getByTestId('run-step').filter({ hasText: '点击（70, 40）' });
+    await expect(missed).toContainText('操作调用完成');
+    await expect(missed).toContainText('div · Empty area');
+    const unexecuted = ui.getByTestId('run-step').filter({ hasText: '点击（50, 220）' });
+    await expect(unexecuted).toContainText('未执行');
+    await expect(unexecuted.getByRole('button', { name: '执行后截图' })).toHaveCount(0);
+    assert.equal(submissions, 0);
+    await ui.screenshot({ path: path.join(data, 'missed-click.png'), fullPage: true });
+    const run = (await ui.evaluate(() => window.workspace.state())).runs[0]!;
+    const evidence = run.events.find(e => e.type === 'step-evidence' && e.stage === 'before');
+    assert.ok(evidence?.type === 'step-evidence' && evidence.image);
+    const shot = { runId: run.runId, image: evidence.image };
+    const before = await ui.evaluate(shot => window.workspace.runScreenshot(shot), shot);
+    await app.close();
+    app = await electron.launch({ args: [process.cwd()], env });
+    ui = await app.firstWindow();
+    assert.equal(await ui.evaluate(shot => window.workspace.runScreenshot(shot), shot), before);
+    await ui.getByRole('button', { name: 'Run History', exact: true }).click();
+    await ui.getByTestId('run-row').first().click();
+    await ui.getByTestId('run-step').filter({ hasText: '点击（70, 40）' }).getByRole('button', { name: '执行前截图' }).click();
+    await ui.getByRole('img', { name: '运行步骤截图' }).waitFor();
+    await ui.waitForFunction(() => (document.querySelector('[role="dialog"] img') as HTMLImageElement)?.naturalWidth > 0);
+    await ui.screenshot({ path: path.join(data, 'missed-click-evidence.png'), animations: 'disabled' });
+    console.log(`Missed click verification data: ${data}`);
+  } finally { await app?.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });

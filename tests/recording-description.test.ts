@@ -4,6 +4,9 @@ import { createServer, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { chromium } from 'playwright';
+import { describeRecordedTarget } from '../src/recording/describe.js';
+import type { RecordedEvent } from '../src/shared/recording.js';
 import { RecordingService } from '../src/main/recording.js';
 
 async function until(predicate: () => boolean, timeout = 25_000) {
@@ -14,7 +17,7 @@ async function until(predicate: () => boolean, timeout = 25_000) {
   }
 }
 
-test('official model requests enrich recorded events after stop and save; official fallback and failures preserve evidence', { timeout: 90_000 }, async () => {
+test('verified official model requests finish after stop and save; failures preserve evidence', { timeout: 90_000 }, async () => {
   const calls: { model: string; primary: boolean; image: string; version?: string }[] = [];
   let held: (() => void) | undefined;
   const server = createServer((request, response) => {
@@ -33,12 +36,12 @@ test('official model requests enrich recorded events after stop and save; offici
       assert.equal(payload.stream, false);
       assert.equal(request.headers.authorization, 'Bearer local-test-key');
       const reply = (res: ServerResponse) => {
-        const fail = payload.model === 'recorder-failure' || (payload.model === 'recorder-fallback' && primary);
-        const content = fail ? {} : primary ? { description: '消息输入框 official-test-42' } : { elementDescription: '消息输入框 official-test-42', confidence: 'high' };
+        const fail = payload.model === 'recorder-failure';
+        const content = fail ? {} : primary ? { description: '消息输入框 official-test-42' } : { bbox: [20, 20, 220, 60] };
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ id: 'local-test', object: 'chat.completion', created: 1700000000, model: payload.model, choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(content) }, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } }));
       };
-      if (payload.model === 'recorder-primary') held = () => reply(response);
+      if (payload.model === 'recorder-primary' && primary && calls.filter((call) => call.model === payload.model && call.primary).length === 1) held = () => reply(response);
       else reply(response);
     });
   });
@@ -49,9 +52,9 @@ test('official model requests enrich recorded events after stop and save; offici
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('MIDSCENE_MODEL') && !key.startsWith('OPENAI_')));
   try {
-    for (const model of ['recorder-primary', 'recorder-fallback', 'recorder-failure']) {
+    for (const model of ['recorder-primary', 'recorder-failure']) {
       const id = await recorder.start({ projectId: 'p', caseId: 'c', workflowId: 'w', caseName: 'Local describe', environmentId: 'local', baseUrl, revision: 'r' }, {
-        ...environment, MIDSCENE_MODEL_NAME: model, MIDSCENE_MODEL_BASE_URL: `${baseUrl}/v1`, MIDSCENE_MODEL_API_KEY: 'local-test-key', MIDSCENE_MODEL_RETRY_COUNT: '0', MIDSCENE_MODEL_TIMEOUT: '10000',
+        ...environment, MIDSCENE_MODEL_NAME: model, MIDSCENE_MODEL_FAMILY: 'gpt-5', MIDSCENE_MODEL_BASE_URL: `${baseUrl}/v1`, MIDSCENE_MODEL_API_KEY: 'local-test-key', MIDSCENE_MODEL_RETRY_COUNT: '0', MIDSCENE_MODEL_TIMEOUT: '10000',
       });
       await recorder.interact(id, { actionType: 'Tap', x: 60, y: 35 });
       await until(() => calls.some((call) => call.model === model));
@@ -72,7 +75,8 @@ test('official model requests enrich recorded events after stop and save; offici
         assert.equal(tap().semantic?.status, 'failed');
       } else {
         assert.equal(tap().semantic?.status, 'ready');
-        assert.equal(tap().semantic?.source, model === 'recorder-primary' ? 'aiDescribe' : 'recorderAI');
+        assert.equal(tap().semantic?.source, 'aiDescribe');
+        assert.equal(tap().semantic?.aiDescribe?.verifyPassed, true);
         assert.match(tap().semantic!.actionSummary!, /official-test-42/);
         assert.match(tap().semantic!.replayInstruction!, /official-test-42/);
         const archived = JSON.parse(readFileSync(path.join(root, 'recordings', id, 'draft.json'), 'utf8'));
@@ -85,12 +89,65 @@ test('official model requests enrich recorded events after stop and save; offici
       recorder.saved(id);
     }
     assert.ok(calls.every((call) => call.version && /^data:image\//.test(call.image)));
-    assert.ok(calls.some((call) => call.model === 'recorder-fallback' && call.primary));
-    assert.ok(calls.some((call) => call.model === 'recorder-fallback' && !call.primary));
+    assert.ok(calls.some((call) => call.model === 'recorder-primary' && !call.primary), 'description must be followed by a real locator model request');
   } finally {
     held?.();
     await recorder.shutdown();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+
+test('saved Retina screenshots verify the recorded point, retry wrong targets and retain failures', { timeout: 30000 }, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1920, height: 902 }, deviceScaleFactor: 2 });
+    await page.setContent('<button style="position:absolute;left:1450px;top:375px;width:40px;height:40px">Send</button>');
+    const screenshot = 'data:image/png;base64,' + (await page.screenshot()).toString('base64');
+    await page.setContent('The current page has changed and must not be used for verification');
+    const event: RecordedEvent = { hashId: 'send', type: 'click', actionType: 'Tap', timestamp: 1, pageInfo: { width: 1920, height: 902 }, elementRect: { x: 1467, y: 391 }, rawPayload: { actionType: 'Tap', x: 1467, y: 391 }, screenshotAsset: { id: 'saved', mimeType: 'image/png', bytes: 1 } };
+    for (const scenario of ['retry-success', 'wrong-target', 'locate-error', 'describe-error']) {
+      let descriptions = 0, locations = 0;
+      const depths: boolean[] = [];
+      const fakeAgent = {
+        modelConfigManager: { getModelConfig: () => ({ modelName: 'fixture-model', apiKey: 'local-test-key' }) },
+        service: {
+          describe: async (point: number[], _runtime: unknown, options: any) => {
+            descriptions++;
+            if (scenario === 'describe-error') throw new Error('provider details');
+            assert.deepEqual(point, [2934, 782]);
+            assert.deepEqual(options.context.shotSize, { width: 3840, height: 1804 });
+            assert.equal(options.context.screenshot.base64, screenshot);
+            depths.push(options.deepDescribe);
+            return { description: descriptions === 1 ? '左侧历史会话' : '发送按钮' };
+          },
+          locate: async (_prompt: unknown, options: any) => {
+            locations++;
+            assert.equal(options.context.screenshot.base64, screenshot);
+            if (scenario === 'locate-error') throw new Error('provider details');
+            const correct = scenario === 'retry-success' && descriptions === 2;
+            return { element: correct ? { center: [2940, 790], rect: { left: 2900, top: 750, width: 80, height: 80 } } : { center: [100, 700], rect: { left: 40, top: 680, width: 120, height: 40 } } };
+          },
+        },
+      } as unknown as Parameters<typeof describeRecordedTarget>[0];
+      const result = await describeRecordedTarget(fakeAgent, event, screenshot);
+      assert.deepEqual(result.rawPayload, event.rawPayload);
+      assert.deepEqual(result.screenshotAsset, event.screenshotAsset);
+      if (scenario === 'retry-success') {
+        assert.equal(result.semantic?.status, 'ready');
+        assert.equal(result.semantic?.aiDescribe?.verifyPassed, true);
+        assert.match(result.semantic!.replayInstruction!, /发送按钮/);
+        assert.deepEqual(depths, [false, true]);
+      } else {
+        assert.equal(result.semantic?.status, 'failed');
+        assert.equal(result.semantic?.aiDescribe?.verifyPassed, false);
+        assert.equal(result.semantic?.replayInstruction, undefined);
+        assert.equal(result.elementDescription, undefined);
+        assert.doesNotMatch(JSON.stringify(result), /provider details/);
+      }
+      assert.equal(descriptions, scenario === 'describe-error' ? 1 : 2);
+      assert.equal(locations, scenario === 'describe-error' ? 0 : 2);
+    }
+  } finally { await browser.close(); }
 });
