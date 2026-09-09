@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Background, Handle, Position, ReactFlow, ReactFlowProvider, useNodesInitialized, useReactFlow, type Edge, type Node, type NodeProps } from '@xyflow/react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Background, Handle, Position, ReactFlow, ReactFlowProvider, useReactFlow, type Edge, type Node, type NodeProps } from '@xyflow/react';
 import { Maximize, Minus, Plus } from 'lucide-react';
 import type { Project, TestGroup } from '../shared/workspace.js';
 import { Button } from '@/components/ui/button';
@@ -7,10 +7,10 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Card, CardContent } from '@/components/ui/card';
 
 const GROUP_PAGE = 8, CASE_PAGE = 12;
-type GraphData = { title: string; subtitle?: string; originalId?: string; selected?: boolean; expanded?: boolean; unavailable?: boolean; disabled?: boolean; expand?: () => void; toggle?: () => void; open?: () => void };
+type GraphData = { title: string; subtitle?: string; originalId?: string; selected?: boolean; expanded?: boolean; unavailable?: boolean; disabled?: boolean; expand?: () => void; toggle?: () => void; open?: () => void; create?: () => void };
 type GraphNode = Node<GraphData>;
 function ProjectNode({ data }: NodeProps<GraphNode>) {
-  return <div data-graph-node="project" className="w-48 rounded-xl border border-primary/30 bg-card p-4 shadow-sm"><strong className="block truncate text-sm">{data.title}</strong><p className="mt-2 text-xs text-muted-foreground">{data.subtitle}</p><Handle type="source" position={Position.Right} className="opacity-0" /></div>;
+  return <div data-graph-node="project" className="group relative w-48 rounded-xl border border-primary/30 bg-card p-4 shadow-sm"><strong className="block truncate text-sm">{data.title}</strong><p className="mt-2 text-xs text-muted-foreground">{data.subtitle}</p><Handle type="source" position={Position.Right} className="opacity-0" style={{ pointerEvents: 'none' }} /><Button size="icon-sm" variant="outline" aria-label={`在项目 ${data.title} 下新建分组`} title="新建分组" disabled={data.disabled} onClick={data.create} className="nodrag nopan absolute -right-4 top-1/2 z-10 size-8 -translate-y-1/2 rounded-full border-primary/40 bg-card text-primary opacity-0 shadow-sm transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"><Plus /></Button></div>;
 }
 function GroupNode({ data }: NodeProps<GraphNode>) {
   return <div data-graph-node="group" data-group-id={data.originalId} className={`flex w-64 items-center gap-2 rounded-xl border bg-card p-3 shadow-sm ${data.expanded ? 'border-primary' : 'border-border'}`}>
@@ -24,11 +24,19 @@ function CaseNode({ data }: NodeProps<GraphNode>) {
   return <div data-graph-node="case" data-case-id={data.originalId} className="w-64 rounded-lg border bg-card p-2 shadow-sm"><Handle type="target" position={Position.Left} className="opacity-0" /><Button variant="ghost" className="nodrag nopan h-auto w-full justify-start whitespace-normal py-2 text-left text-xs" aria-label={`打开用例 ${data.title}`} disabled={data.unavailable} onClick={data.open}>{data.title}</Button></div>;
 }
 const nodeTypes = { project: ProjectNode, testGroup: GroupNode, case: CaseNode };
-type Props = { project: Project; groups: TestGroup[]; selected: string[]; toggle(id: string): void; openCase(id: string): void; disabled?: boolean; search?: string };
-function GraphCanvas({ project, groups, selected, toggle, openCase, disabled = false, search = '' }: Props) {
+type Props = { project: Project; groups: TestGroup[]; selected: string[]; toggle(id: string): void; openCase(id: string): void; createGroup(): void; revealGroupId?: string; disabled?: boolean; search?: string };
+function GraphCanvas({ project, groups, selected, toggle, openCase, createGroup, revealGroupId, disabled = false, search = '' }: Props) {
   const [groupPage, setGroupPage] = useState(0), [casePage, setCasePage] = useState(0);
   const [expanded, setExpanded] = useState(''), [zoom, setZoom] = useState(1);
-  const flow = useReactFlow<GraphNode>(), initialized = useNodesInitialized();
+  const flow = useReactFlow<GraphNode>();
+  const revealed = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!revealGroupId || revealed.current === revealGroupId) return;
+    const index = groups.findIndex(item => item.id === revealGroupId);
+    if (index < 0) return;
+    revealed.current = revealGroupId;
+    setGroupPage(Math.floor(index / GROUP_PAGE)); setExpanded(revealGroupId); setCasePage(0);
+  }, [revealGroupId, groups]);
   const cases = useMemo(() => new Map(project.cases.map(item => [item.id, item])), [project.cases]);
   const currentGroupPage = Math.min(groupPage, Math.max(0, Math.ceil(groups.length / GROUP_PAGE) - 1));
   const visible = groups.slice(currentGroupPage * GROUP_PAGE, (currentGroupPage + 1) * GROUP_PAGE);
@@ -41,7 +49,7 @@ function GraphCanvas({ project, groups, selected, toggle, openCase, disabled = f
   const members = memberIds.slice(currentCasePage * CASE_PAGE, (currentCasePage + 1) * CASE_PAGE);
   const height = Math.max(360, visible.length * 105, members.length * 75);
   const nodes: GraphNode[] = [
-    { id: 'project', type: 'project', position: { x: 0, y: height / 2 - 42 }, data: { title: project.name, subtitle: groups.length + ' 个分组' } },
+    { id: 'project', type: 'project', style: { pointerEvents: 'all' }, position: { x: 0, y: height / 2 - 42 }, data: { title: project.name, subtitle: groups.length + ' 个分组', create: createGroup, disabled } },
     ...visible.map((item, index): GraphNode => ({ id: 'group:' + item.id, type: 'testGroup', style: { pointerEvents: 'all' }, position: { x: 310, y: index * 105 }, data: {
       title: item.name, subtitle: item.caseIds.length + ' 个用例', originalId: item.id, selected: selected.includes(item.id), expanded: expanded === item.id, disabled,
       expand: () => { setExpanded(expanded === item.id ? '' : item.id); setCasePage(0); }, toggle: () => toggle(item.id),
@@ -53,11 +61,16 @@ function GraphCanvas({ project, groups, selected, toggle, openCase, disabled = f
     ...members.map(id => ({ id: 'member-' + id, source: 'group:' + group!.id, target: 'case:' + id })),
   ];
   const layoutKey = visible.map(item => item.id).join('|') + ':' + (group?.id ?? '') + ':' + members.join('|');
-  useEffect(() => { if (initialized) void flow.fitView({ padding: 0.18, maxZoom: 1.1, duration: 0 }); }, [initialized, layoutKey, flow]);
+  useEffect(() => {
+    if (!flow.viewportInitialized) return;
+    const newGroup = group?.id === revealGroupId ? group : undefined;
+    // React Flow queues fitView until the controlled nodes have been measured.
+    void flow.fitView({ padding: 0.18, maxZoom: 1.1, duration: 0, ...(newGroup ? { nodes: [{ id: 'group:' + newGroup.id }] } : {}) });
+  }, [layoutKey, flow, revealGroupId]);
   return <Card data-testid="group-graph"><CardContent className="space-y-4">
     <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-muted-foreground">连线表示归属关系，不代表执行依赖。拖动画布平移，点击分组展开成员，点击用例查看详情。</p><div className="flex items-center gap-2"><Button size="icon-sm" variant="outline" aria-label="缩小关系图" disabled={zoom <= 0.2} onClick={() => void flow.zoomOut({ duration: 0 })}><Minus /></Button><span aria-label="关系图缩放比例" className="w-12 text-center text-xs">{Math.round(zoom * 100)}%</span><Button size="icon-sm" variant="outline" aria-label="放大关系图" disabled={zoom >= 2} onClick={() => void flow.zoomIn({ duration: 0 })}><Plus /></Button><Button size="icon-sm" variant="outline" aria-label="适应关系图" onClick={() => void flow.fitView({ padding: 0.18, maxZoom: 1.1, duration: 0 })}><Maximize /></Button></div></div>
     <div data-testid="group-graph-canvas" className="h-[560px] overflow-hidden rounded-lg border bg-muted/20">
-      <ReactFlow<GraphNode> nodes={nodes} edges={edges} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18, maxZoom: 1.1 }} minZoom={0.2} maxZoom={2} nodesDraggable={false} nodesConnectable={false} nodesFocusable={false} edgesFocusable={false} elementsSelectable={false} onMove={(_event, viewport) => setZoom(viewport.zoom)} preventScrolling aria-label="项目分组用例关系图">
+      <ReactFlow<GraphNode> nodes={nodes} edges={edges} nodeTypes={nodeTypes} minZoom={0.2} maxZoom={2} nodesDraggable={false} nodesConnectable={false} nodesFocusable={false} edgesFocusable={false} elementsSelectable={false} onMove={(_event, viewport) => setZoom(viewport.zoom)} preventScrolling aria-label="项目分组用例关系图">
         <Background gap={24} size={1} />
       </ReactFlow>
     </div>

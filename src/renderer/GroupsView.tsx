@@ -18,7 +18,7 @@ function Pager({ label, page, count, change }: { label: string; page: number; co
   const pages = Math.max(1, Math.ceil(count / PAGE));
   return <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground"><span>{count} 项 · 第 {page + 1} / {pages} 页</span><div className="flex gap-2"><Button type="button" size="sm" variant="outline" aria-label={label + '上一页'} disabled={page === 0} onClick={() => change(page - 1)}>上一页</Button><Button type="button" size="sm" variant="outline" aria-label={label + '下一页'} disabled={page + 1 >= pages} onClick={() => change(page + 1)}>下一页</Button></div></div>;
 }
-function GroupEditor({ project, initial, close, refresh }: { project: Project; initial: SaveGroupInput; close(): void; refresh(): Promise<void> }) {
+function GroupEditor({ project, initial, close, refresh, saved }: { project: Project; initial: SaveGroupInput; close(): void; refresh(): Promise<void>; saved(id: string): void }) {
   const [draft, setDraft] = useState(initial), [query, setQuery] = useState(''), [suite, setSuite] = useState('all'), [tag, setTag] = useState('');
   const [onlySelected, setOnlySelected] = useState(false), [page, setPage] = useState(0), [selectedPage, setSelectedPage] = useState(0);
   const [busy, setBusy] = useState(false), [error, setError] = useState(''); const working = useRef(false);
@@ -35,7 +35,7 @@ function GroupEditor({ project, initial, close, refresh }: { project: Project; i
   async function save() {
     if (working.current) return;
     working.current = true; setBusy(true); setError('');
-    try { await window.workspace.saveGroup({ ...draft, name: draft.name.trim() }); await refresh(); close(); }
+    try { const id = await window.workspace.saveGroup({ ...draft, name: draft.name.trim() }); await refresh(); saved(id); close(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { working.current = false; setBusy(false); }
   }
@@ -64,12 +64,14 @@ function GroupEditor({ project, initial, close, refresh }: { project: Project; i
 
 export function GroupsView({ project, refresh, openCase, run, runLocked }: { project: Project; refresh(): Promise<void>; openCase(id: string): void; run(ids: string[]): void; runLocked: boolean }) {
   const groups = project.groups ?? [], caseMap = useMemo(() => new Map(project.cases.map(item => [item.id, item])), [project.cases]);
+  const [revealGroupId, setRevealGroupId] = useState('');
   const [mode, setMode] = useState('list'), [query, setQuery] = useState(''), [page, setPage] = useState(0), [selectionPage, setSelectionPage] = useState(0);
   const [selected, setSelected] = useState<string[]>([]), [edit, setEdit] = useState<SaveGroupInput>(), [deleting, setDeleting] = useState<TestGroup>();
   const [error, setError] = useState(''), [busy, setBusy] = useState(false); const working = useRef(false);
   const filtered = groups.filter(group => (group.name + ' ' + group.description).toLowerCase().includes(query.toLowerCase()) || group.caseIds.some(id => { const item = caseMap.get(id); return item && (item.name + ' ' + item.tags.join(' ')).toLowerCase().includes(query.toLowerCase()); }));
   const currentPage = Math.min(page, Math.max(0, Math.ceil(filtered.length / PAGE) - 1)), currentSelectionPage = Math.min(selectionPage, Math.max(0, Math.ceil(selected.length / PAGE) - 1));
   const visible = filtered.slice(currentPage * PAGE, (currentPage + 1) * PAGE);
+  function createGroup() { setError(''); setEdit({ projectId: project.id, name: '', description: '', caseIds: [] }); }
   function toggle(id: string) { setSelected(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]); }
   function move(index: number, offset: number) { setSelected(current => { const next = [...current], target = index + offset; if (target < 0 || target >= next.length) return current; [next[index], next[target]] = [next[target]!, next[index]!]; return next; }); }
   const issues = selected.flatMap(id => {
@@ -88,9 +90,9 @@ export function GroupsView({ project, refresh, openCase, run, runLocked }: { pro
     finally { working.current = false; setBusy(false); }
   }
   return <div className="space-y-5" data-testid="groups-view">
-    <div className="flex flex-wrap items-center justify-between gap-3"><Tabs value={mode} onValueChange={setMode}><TabsList><TabsTrigger value="list">分组列表</TabsTrigger><TabsTrigger value="graph">关系图</TabsTrigger></TabsList></Tabs><Input className="w-72" aria-label="搜索分组或用例" placeholder="搜索分组、用例或标签" value={query} onChange={event => { setQuery(event.target.value); setPage(0); }} /><Button onClick={() => { setError(''); setEdit({ projectId: project.id, name: '', description: '', caseIds: [] }); }}><Plus />新建分组</Button></div>
+    <div className="flex flex-wrap items-center justify-between gap-3"><Tabs value={mode} onValueChange={setMode}><TabsList><TabsTrigger value="list">分组列表</TabsTrigger><TabsTrigger value="graph">关系图</TabsTrigger></TabsList></Tabs><Input className="w-72" aria-label="搜索分组或用例" placeholder="搜索分组、用例或标签" value={query} onChange={event => { setQuery(event.target.value); setPage(0); setRevealGroupId(''); }} /><Button onClick={createGroup}><Plus />新建分组</Button></div>
     {error && !deleting ? <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert> : null}
-    {mode === 'graph' ? <Suspense fallback={<Card><CardContent className="py-10 text-center text-sm text-muted-foreground">正在加载关系图…</CardContent></Card>}><GroupGraph key={query} search={query} project={project} groups={filtered} selected={selected} toggle={toggle} openCase={openCase} disabled={busy} /></Suspense> : <Card className="gap-0 overflow-hidden py-0">
+    {mode === 'graph' ? <Suspense fallback={<Card><CardContent className="py-10 text-center text-sm text-muted-foreground">正在加载关系图…</CardContent></Card>}><GroupGraph key={query} search={query} project={project} groups={filtered} selected={selected} toggle={toggle} openCase={openCase} createGroup={createGroup} revealGroupId={revealGroupId} disabled={busy} /></Suspense> : <Card className="gap-0 overflow-hidden py-0">
       <CardHeader className="flex flex-row items-center justify-between border-b py-4"><CardTitle className="text-base">{filtered.length} 个分组</CardTitle><label className="flex items-center gap-2 text-xs"><Checkbox aria-label="全选本页分组" checked={visible.length > 0 && visible.every(group => selected.includes(group.id))} disabled={!visible.length || busy} onCheckedChange={value => setSelected(current => value ? [...current, ...visible.map(group => group.id).filter(id => !current.includes(id))] : current.filter(id => !visible.some(group => group.id === id)))} />全选本页</label></CardHeader>
       <CardContent className="p-0">{visible.map(group => <div data-testid="group-list-row" data-group-id={group.id} key={group.id} className="flex flex-wrap items-center gap-3 border-b px-5 py-4 last:border-b-0"><Checkbox aria-label={`选择分组 ${group.name}`} checked={selected.includes(group.id)} disabled={busy} onCheckedChange={() => toggle(group.id)} /><div className="min-w-40 flex-1"><strong className="text-sm">{group.name}</strong>{group.description ? <p className="mt-1 break-words text-xs text-muted-foreground">{group.description}</p> : null}</div><Badge variant="outline">{group.caseIds.length} 个用例</Badge><Button size="sm" variant="outline" aria-label={`编辑分组 ${group.name}`} disabled={busy} onClick={() => { setError(''); setEdit({ projectId: project.id, id: group.id, revision: group.revision, name: group.name, description: group.description, caseIds: [...group.caseIds] }); }}><Pencil />编辑</Button><Button size="icon-sm" variant="ghost" aria-label={`删除分组 ${group.name}`} disabled={busy} onClick={() => { setError(''); setDeleting(group); }}><Trash2 /></Button></div>)}{!visible.length ? <p className="p-6 text-sm text-muted-foreground">没有匹配的分组。你可以新建分组，将不同 Suite 的用例组合起来。</p> : null}</CardContent><div className="border-t px-5 py-3"><Pager label="分组列表" page={currentPage} count={filtered.length} change={setPage} /></div>
     </Card>}
@@ -100,7 +102,7 @@ export function GroupsView({ project, refresh, openCase, run, runLocked }: { pro
       {issues.length ? <Alert variant="destructive"><AlertDescription>{issues.slice(0, 3).join('；')}{issues.length > 3 ? `；另有 ${issues.length - 3} 项问题` : ''}。请先编辑分组。</AlertDescription></Alert> : null}
     </CardContent></Card> : null}
     <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 border-t bg-background/95 py-4"><p className="max-w-xl text-xs leading-5 text-muted-foreground">分组是用例的组合，不会复制用例文件。多个分组按这里的顺序执行，组内按成员顺序执行，重复用例只运行一次。</p><Button disabled={busy || runLocked || !selected.length || !!issues.length} onClick={() => run(selected)}><Play />运行所选分组</Button></div>
-    {edit ? <GroupEditor key={edit.id ?? 'new'} project={project} initial={edit} close={() => setEdit(undefined)} refresh={refresh} /> : null}
+    {edit ? <GroupEditor key={edit.id ?? 'new'} project={project} initial={edit} close={() => setEdit(undefined)} refresh={refresh} saved={id => { if (!edit.id && mode === 'graph') { setQuery(''); setRevealGroupId(id); } }} /> : null}
     {deleting ? <Dialog open onOpenChange={open => { if (!open && !busy) setDeleting(undefined); }}><DialogContent showCloseButton={false}><DialogHeader><DialogTitle>删除分组 {deleting.name}？</DialogTitle><DialogDescription>只删除这个分组，用例及其 Workflow 保持不变。</DialogDescription></DialogHeader>{error ? <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert> : null}<DialogFooter><Button variant="outline" disabled={busy} onClick={() => setDeleting(undefined)}>保留分组</Button><Button variant="destructive" disabled={busy} onClick={() => void remove()}>确认删除分组</Button></DialogFooter></DialogContent></Dialog> : null}
   </div>;
 }

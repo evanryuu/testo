@@ -33,7 +33,7 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
           if (existing && existing.revision !== input.revision) return { ok: false, error: '分组版本冲突' };
           value = existing?.id ?? 'created';
           const next = { id: value, name: input.name, description: input.description, caseIds: input.caseIds, revision: String(Number(existing?.revision ?? 0) + 1) };
-          if (existing) groups.splice(groups.indexOf(existing), 1, next); else groups.unshift(next);
+          if (existing) groups.splice(groups.indexOf(existing), 1, next); else groups.push(next);
         } else if (method === 'deleteGroup') {
           const index = groups.findIndex(item => item.id === input.id); if (index >= 0) groups.splice(index, 1);
         } else if (method === 'runGroups') {
@@ -164,6 +164,43 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
     await expect(page.getByTestId('group-list-row')).toHaveCount(0);
     const snapshot = await app.evaluate(() => ({ cases: (globalThis as any).groupsFixture.projects[0].cases.length, groups: (globalThis as any).groupsFixture.projects[0].groups.length }));
     assert.deepEqual(snapshot, { cases: 1006, groups: 1005 });
+    // Create directly from the project node, including a filtered/paginated graph.
+    await page.getByRole('tab', { name: '关系图', exact: true }).click();
+    await page.getByLabel('搜索分组或用例').fill('分组0001');
+    const projectNode = page.locator('[data-graph-node="project"]');
+    const addGroup = page.getByRole('button', { name: '在项目 Groups fixture 下新建分组', exact: true });
+    await page.getByLabel('搜索分组或用例').hover();
+    await expect(addGroup).toHaveCSS('opacity', '0');
+    await projectNode.hover();
+    await expect(addGroup).toHaveCSS('opacity', '1');
+    await page.getByTestId('group-graph-canvas').screenshot({ path: path.join(data, 'graph-add-hover.png') });
+    await addGroup.click();
+    await expect(page.getByRole('dialog')).toContainText('新建分组');
+    await page.getByRole('button', { name: '取消编辑', exact: true }).click();
+    assert.equal(await app.evaluate(() => (globalThis as any).groupsFixture.projects[0].groups.length), 1005);
+    await page.getByLabel('搜索分组或用例').fill('没有匹配结果');
+    await expect(page.locator('[data-graph-node="group"]')).toHaveCount(0);
+    await addGroup.focus();
+    await expect(addGroup).toHaveCSS('opacity', '1');
+    await page.keyboard.press('Enter');
+    await page.getByLabel('分组名称', { exact: true }).fill('从节点新建');
+    await page.getByRole('button', { name: '保存分组', exact: true }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(page.getByLabel('搜索分组或用例')).toHaveValue('');
+    const created = page.locator('[data-graph-node="group"][data-group-id="created"]');
+    await expect(created).toBeVisible();
+    await expect(created).toContainText('从节点新建');
+    await expect(page.locator('.react-flow__edge[data-id="project-created"]')).toHaveCount(1);
+    const parentBox = await projectNode.boundingBox(), createdBox = await created.boundingBox();
+    assert.ok(parentBox && createdBox && createdBox.x > parentBox.x + parentBox.width);
+    await expect(page.getByRole('button', { name: '关系图上一页分组', exact: true })).toBeEnabled();
+    await expect.poll(async () => {
+      const node = await created.boundingBox(), canvas = await page.getByTestId('group-graph-canvas').boundingBox();
+      return node && canvas ? Math.abs(node.y + node.height / 2 - canvas.y - canvas.height / 2) : Infinity;
+    }).toBeLessThan(10);
+    await created.getByRole('checkbox').check();
+    await created.getByRole('checkbox').uncheck();
+    await page.getByTestId('group-graph-canvas').screenshot({ path: path.join(data, 'graph-group-created.png') });
     assert.deepEqual(errors, []);
     console.log('Groups UI evidence:', data);
   } finally { await app?.close(); }
