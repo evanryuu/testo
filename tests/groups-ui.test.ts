@@ -24,6 +24,7 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
       ipcMain.removeHandler('workspace:call');
       ipcMain.handle('workspace:call', async (_event, method, input) => {
         if (method === 'state') return { ok: true, value: state };
+        if (method === 'browserProfiles') return { ok: true, value: [] };
         (globalThis as any).groupsCalls.push({ method, input });
         let value: any;
         if (method === 'saveGroup') {

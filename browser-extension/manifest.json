@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Testo Chrome Connector",
+  "version": "0.1.0",
+  "description": "Connect this Chrome profile to the local Testo workspace using Midscene.",
+  "permissions": [
+    "tabs",
+    "debugger",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "配置 Testo 连接"
+  },
+  "minimum_chrome_version": "120"
+}

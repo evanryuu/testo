@@ -24,6 +24,16 @@ test('desktop creates assets, runs real workflows, opens report and restores his
     const page = await application.firstWindow();
     const uiErrors: string[] = [];
     page.on('pageerror', (e) => uiErrors.push(e.message));
+    await page.getByRole('button', { name: '新建项目', exact: true }).waitFor();
+    const profileLifecycle = await page.evaluate(async () => {
+      const first = await window.workspace.addBrowserProfile();
+      const second = await window.workspace.addBrowserProfile();
+      const list = await window.workspace.browserProfiles();
+      await window.workspace.removeBrowserProfile({ id: first.id });
+      await window.workspace.removeBrowserProfile({ id: second.id });
+      return { distinct: first.id !== second.id && first.pairingCode !== second.pairingCode, count: list.length, remaining: (await window.workspace.browserProfiles()).length };
+    });
+    assert.deepEqual(profileLifecycle, { distinct: true, count: 2, remaining: 0 });
     await page.getByRole('button', { name: '新建项目', exact: true }).click();
     await page.getByLabel('项目名称', { exact: true }).fill('未保存草稿');
     await page.keyboard.press('Escape');

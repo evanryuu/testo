@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, safeStorage, clipboard, shell } from 'electron';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, realpathSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +7,7 @@ import { collectWorkflowDocument, NodeRegistry } from '@midscene/test';
 import { createMidsceneNodes } from '@midscene/test/midscene';
 import { createPlaywrightNodes } from '@midscene/test/playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
+import { BrowserProfileService } from './browser-profiles.js';
 import { WorkspaceStore } from './workspace.js';
 import { RecordingService } from './recording.js';
 import { captureChromeSession, type ChromeTarget } from '../recording/chrome-bridge.js';
@@ -42,15 +43,31 @@ const modelSettings = (): ModelSettings => {
 const change = () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('workspace:changed'); };
 
 const recorder = new RecordingService(dataDir, change);
+const browserProfiles = new BrowserProfileService(change);
 // Bindings live only for this app session; no cookies or Chrome profile are copied.
 const sessions = new Map<string, { info: BrowserSession; target: ChromeTarget }>();
 let preparing = false;
 let connectingSession = false;
 let connectionResult: Promise<ChromeTarget> | undefined;
 const batchQueue = new BatchQueue(batch => { history.saveBatch(batch); change(); });
-const occupied = () => !!active || !!batchQueue.active || preparing || quitting;
+const occupied = () => !!active || !!batchQueue.active || preparing || browserProfiles.busy || quitting;
 const chromeTargets = new Map<string, ChromeTarget>();
 const chromeKey = (i: { projectId: string; caseId: string; workflowId: string; environmentId: string }) => JSON.stringify([i.projectId, i.caseId, i.workflowId, i.environmentId]);
+
+function sameTab(a: ChromeTarget, b: ChromeTarget): boolean {
+  return a.tabId === b.tabId && a.origin === b.origin
+    && a.profile?.connectorId === b.profile?.connectorId
+    && a.profile?.profileInstallationId === b.profile?.profileInstallationId;
+}
+async function browserOperation<T>(operation: () => Promise<T>): Promise<T> {
+  if (occupied() || recorder.active) throw new Error('请先结束运行或录制，再选择浏览器标签页');
+  preparing = true; connectingSession = true; change();
+  try {
+    await recorder.release();
+    if (quitting) throw new Error('应用正在退出');
+    return await operation();
+  } finally { preparing = false; connectingSession = false; change(); }
+}
 
 function modelEnvironment(): NodeJS.ProcessEnv {
   const m = modelData();
@@ -120,7 +137,7 @@ async function startBatch(i: BatchInput, project: Project, groupPlan?: ReturnTyp
   const plans = i.items.map(item => {
     const plan = prepareRun({ ...item, projectId: i.projectId, environmentId: i.environmentId }, project);
     const session = sessions.get(item.sessionId);
-    if (!session || session.info.projectId !== i.projectId || session.info.environmentId !== i.environmentId || session.target.origin !== new URL(plan.environment.web.baseUrl).origin) throw new Error(`请为 ${plan.item.name} 选择此环境已确认的登录窗口`);
+    if (!session || session.info.projectId !== i.projectId || session.info.environmentId !== i.environmentId || session.target.origin !== new URL(plan.environment.web.baseUrl).origin) throw new Error(`请为 ${plan.item.name} 选择此环境的运行标签页`);
     return { plan, session: { info: { ...session.info }, target: { ...session.target } } };
   });
   preparing = true;
@@ -169,6 +186,41 @@ const handlers: Record<string, (input: any) => unknown> = {
       return launchRun(plan, chromeTarget).runId;
     } finally { preparing = false; }
   },
+  browserProfiles: () => browserProfiles.list(),
+  addBrowserProfile: () => browserOperation(() => browserProfiles.create()),
+  refreshBrowserProfile: (i) => browserOperation(() => browserProfiles.refresh(i.id)),
+  focusBrowserTab: (i) => browserOperation(() => browserProfiles.focus(i.profileId, i.tabId)),
+  useBrowserTab: (i) => browserOperation(async () => {
+    const project = store.project(i.projectId);
+    const environment = project.environments.find(e => e.id === i.environmentId);
+    if (!environment) throw new Error('请选择运行环境');
+    const { target, tab, profile } = await browserProfiles.capture(i.profileId, i.tabId, new URL(environment.web.baseUrl).origin);
+    for (const [key, previous] of chromeTargets) if (sameTab(previous, target)) chromeTargets.set(key, target);
+    for (const session of sessions.values()) if (sameTab(session.target, target)) session.target = target;
+    const existing = [...sessions.values()].find(s => sameTab(s.target, target) && s.info.projectId === i.projectId && s.info.environmentId === i.environmentId);
+    const id = existing?.info.id ?? randomUUID();
+    const name = `${profile.name} · 窗口 ${tab.windowId} · ${tab.title || tab.url}`;
+    sessions.set(id, { info: { id, name, projectId: i.projectId, environmentId: i.environmentId, origin: target.origin,
+      profileId: profile.id, profileName: profile.name, profileInstallationId: profile.profileInstallationId,
+      tabId: tab.tabId, windowId: tab.windowId, title: tab.title, url: tab.url }, target });
+    return id;
+  }),
+  removeBrowserProfile: (i) => browserOperation(async () => {
+    browserProfiles.remove(i.id);
+    for (const [id, session] of sessions) if (session.info.profileId === i.id) sessions.delete(id);
+    for (const [key, target] of chromeTargets) if (target.profile?.connectorId === i.id) chromeTargets.delete(key);
+  }),
+  openBrowserConnector: async () => {
+    const directory = path.join(root, 'dist-browser-extension');
+    if (!existsSync(path.join(directory, 'manifest.json'))) throw new Error('连接扩展尚未构建，请先运行 npm run build:connector');
+    const error = await shell.openPath(directory);
+    if (error) throw new Error(error);
+  },
+  copyBrowserPairingCode: (i) => {
+    const profile = browserProfiles.list().find(profile => profile.id === i.id);
+    if (!profile) throw new Error('浏览器配置不存在');
+    clipboard.writeText(profile.pairingCode);
+  },
   captureSession: async (i) => {
     if (occupied() || recorder.active) throw new Error('请先结束运行或录制，再确认登录窗口');
     const name = typeof i.name === 'string' ? i.name.trim() : '';
@@ -183,9 +235,9 @@ const handlers: Record<string, (input: any) => unknown> = {
       connectionResult = captureChromeSession(new URL(environment.web.baseUrl).origin);
       const target = await connectionResult;
       // Reconfirming a tab refreshes all bindings to its new token.
-      for (const [key, previous] of chromeTargets) if (previous.tabId === target.tabId && previous.origin === target.origin) chromeTargets.set(key, target);
-      for (const session of sessions.values()) if (session.target.tabId === target.tabId && session.target.origin === target.origin) session.target = target;
-      const existing = [...sessions.values()].find(s => s.target.tabId === target.tabId && s.info.projectId === i.projectId && s.info.environmentId === i.environmentId);
+      for (const [key, previous] of chromeTargets) if (sameTab(previous, target)) chromeTargets.set(key, target);
+      for (const session of sessions.values()) if (sameTab(session.target, target)) session.target = target;
+      const existing = [...sessions.values()].find(s => sameTab(s.target, target) && s.info.projectId === i.projectId && s.info.environmentId === i.environmentId);
       const id = existing?.info.id ?? randomUUID();
       sessions.set(id, { info: { id, name, projectId: i.projectId, environmentId: i.environmentId, origin: target.origin }, target });
       return id;
@@ -226,7 +278,7 @@ const handlers: Record<string, (input: any) => unknown> = {
       const draft = recorder.require(i.id);
       if (draft.chromeTarget) {
         chromeTargets.set(chromeKey(draft), draft.chromeTarget);
-        for (const session of sessions.values()) if (session.target.tabId === draft.chromeTarget.tabId && session.target.origin === draft.chromeTarget.origin) session.target = draft.chromeTarget;
+        for (const session of sessions.values()) if (sameTab(session.target, draft.chromeTarget)) session.target = draft.chromeTarget;
       }
     } finally { preparing = false; }
   },
@@ -238,7 +290,7 @@ const handlers: Record<string, (input: any) => unknown> = {
       const draft = recorder.require(i.id);
       if (draft.chromeTarget) {
         chromeTargets.set(chromeKey(draft), draft.chromeTarget);
-        for (const session of sessions.values()) if (session.target.tabId === draft.chromeTarget.tabId && session.target.origin === draft.chromeTarget.origin) session.target = draft.chromeTarget;
+        for (const session of sessions.values()) if (sameTab(session.target, draft.chromeTarget)) session.target = draft.chromeTarget;
       }
     } finally { preparing = false; }
   },
@@ -306,7 +358,7 @@ ipcMain.handle('workspace:call', async (event, name: string, input: unknown) => 
   if (event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame || !Object.hasOwn(handlers, name)) return { ok: false, error: '不允许的操作' };
   try {
     const value = await handlers[name]!(input);
-    if (!['state', 'workflow', 'importFile', 'openReport', 'recordingFrame', 'recordingScreenshot', 'buildRecording'].includes(name)) change();
+    if (!['state', 'browserProfiles', 'copyBrowserPairingCode', 'openBrowserConnector', 'workflow', 'importFile', 'openReport', 'recordingFrame', 'recordingScreenshot', 'buildRecording'].includes(name)) change();
     return { ok: true, value };
   } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
 });
@@ -325,7 +377,7 @@ app.on('before-quit', (event) => {
   if (!quitting) {
     event.preventDefault(); quitting = true;
     if (batchQueue.active) batchQueue.cancel(batchQueue.active.id);
-    active?.cancel(); void Promise.allSettled([connectionResult, batchQueue.result, active?.result, recorder.shutdown()]).finally(() => app.quit());
+    active?.cancel(); void Promise.allSettled([browserProfiles.destroy(), connectionResult, batchQueue.result, active?.result, recorder.shutdown()]).finally(() => app.quit());
   }
 });
 app.on('window-all-closed', () => app.quit());

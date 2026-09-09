@@ -12,12 +12,13 @@
     "test:runner": "npm run build:runner && node --test --test-concurrency=1 dist/tests/runner.test.js",
     "run:workflow": "node dist/src/runner/cli.js",
     "typecheck:desktop": "tsc --noEmit && tsc -p tsconfig.ui.json && tsc -p tsconfig.preview.json",
-    "build:desktop": "tsc && tsc -p tsconfig.ui.json && vite build && npm run build:preview",
+    "build:desktop": "tsc && tsc -p tsconfig.ui.json && vite build && npm run build:preview && npm run build:connector",
     "desktop": "electron .",
     "test:desktop": "node --test --test-concurrency=1 dist/tests/desktop.test.js",
     "test:recording": "node --test --test-concurrency=1 dist/tests/navigation.test.js dist/tests/viewport.test.js dist/tests/wait.test.js dist/tests/wait-integration.test.js dist/tests/recording-retry.test.js dist/tests/recorded-workflow.test.js dist/tests/recording-events.test.js dist/tests/recording-description.test.js dist/tests/recording.test.js",
     "build:preview": "tsc -p tsconfig.preview.json && vite build --config vite.preview.config.ts",
-    "test:chrome-bridge": "node --test --test-concurrency=1 dist/tests/chrome-bridge.test.js"
+    "test:chrome-bridge": "node --test --test-concurrency=1 dist/tests/chrome-bridge.test.js",
+    "build:connector": "node scripts/build-browser-extension.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "5.5.0",

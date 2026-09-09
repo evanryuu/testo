@@ -1,3 +1,4 @@
+import type { ChromeProfileInfo } from './browser.js';
 import type { RecordingDraft, RecordingFrame, RecordingInteraction } from './recording.js';
 import type { RecordingStepChoice, RecordingAssertion, RecordingReviewStep } from '../recording/workflow.js';
 import type { RunResult, WorkerEvent } from '../runner/messages.js';
@@ -24,6 +25,8 @@ export interface HistoryRun {
 }
 export interface BrowserSession {
   id: string; name: string; projectId: string; environmentId: string; origin: string;
+  profileId?: string; profileName?: string; profileInstallationId?: string;
+  tabId?: string; windowId?: number; title?: string; url?: string;
 }
 export interface BatchInput {
   projectId: string; environmentId: string; failurePolicy: 'stop' | 'continue';
@@ -54,6 +57,14 @@ export interface DesktopApi {
   saveEnvironment(input: { projectId: string; id?: string; name: string; baseUrl: string }): Promise<void>;
   run(input: { projectId: string; caseId: string; workflowId: string; environmentId: string; browserMode?: 'isolated' | 'bridge' }): Promise<string>;
   cancelRun(): Promise<void>;
+  browserProfiles(): Promise<ChromeProfileInfo[]>;
+  addBrowserProfile(): Promise<ChromeProfileInfo>;
+  refreshBrowserProfile(input: { id: string }): Promise<ChromeProfileInfo>;
+  focusBrowserTab(input: { profileId: string; tabId: string }): Promise<void>;
+  useBrowserTab(input: { projectId: string; environmentId: string; profileId: string; tabId: string }): Promise<string>;
+  removeBrowserProfile(input: { id: string }): Promise<void>;
+  openBrowserConnector(): Promise<void>;
+  copyBrowserPairingCode(input: { id: string }): Promise<void>;
   captureSession(input: { projectId: string; environmentId: string; name: string }): Promise<string>;
   runBatch(input: BatchInput): Promise<string>;
   cancelBatch(input: { id: string }): Promise<void>;

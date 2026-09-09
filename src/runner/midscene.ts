@@ -127,7 +127,7 @@ export async function executeWorkflow(
     ] });
     signal.throwIfAborted();
     if (options.chromeTarget) {
-      bridgeAgent = createChromeBridge('chrome-session');
+      bridgeAgent = createChromeBridge('chrome-session', options.chromeTarget.profile?.port);
       await connectChrome(bridgeAgent, new URL(options.baseUrl).origin, options.chromeTarget);
       await waitForStableViewport(() => bridgeAgent!.interface.size(), { signal });
     } else {

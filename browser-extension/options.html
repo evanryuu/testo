@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Testo Chrome Connector</title><link rel="stylesheet" href="options.css"></head>
+<body><main><h1>连接 Testo</h1><p>在你希望使用的 Chrome 用户配置中安装并配置此扩展。</p>
+<form id="settings"><label for="name">连接名称</label><input id="name" maxlength="80" required autocomplete="off"><p class="hint">名称由你填写，扩展不会读取 Chrome 用户配置的真实名称。</p>
+<label for="pairing">Testo 连接代码</label><textarea id="pairing" rows="3" required spellcheck="false" placeholder="testo://connect?port=…&amp;token=…"></textarea><p class="hint">在 Testo 创建 Chrome 连接后复制代码。代码仅连接本机 127.0.0.1；保存后允许 Testo 列出此用户配置的网页，并操作你在应用中选择的标签页。</p>
+<div class="actions"><button type="submit">保存并连接</button><button type="button" id="disconnect">断开连接</button></div></form>
+<p id="status" role="status" aria-live="polite"></p><p id="error" role="alert"></p>
+<p class="hint">配置保存后可关闭此页面。连接会在后台自动恢复；断开连接会停止自动重连。</p></main><script src="options.js"></script></body></html>

@@ -209,3 +209,17 @@
 集成测试使用本地模型 HTTP stub，经过官方截图、请求和 XML 解析，没有调用真实模型或使用真实账号。首轮 stub 的 data-json 格式不符合官方 Assert 响应，已修正为 StatementIsTruthy 后通过，不是产品实现改动。真实 Longbridge 页面能否被模型正确判断“本次回答结束”仍需用户重跑验证。
 
 固定 1.12.4 的官方 aiWaitFor 循环不支持有效取消，因此平台调用官方 aiAssert 的可取消单次检查，并自行管理串行间隔与截止时间。未改动视觉识别实现。完整能力清单与已知模式差异见 README 的“Midscene 能力接入状态”。本次没有接入移动端、没有扩展其他高级 API，也没有 commit/push。
+
+
+## 2026-09-09 Chrome Profile 与精确标签页选择
+
+批量运行和 Group 运行改为按 Profile、窗口和标签页选择，显示标题、完整网址和序号，支持查看、使用、刷新和解除配对。每个 Profile 使用独立本机端口、随机配对码和安装标识；回放验证身份、标签页 ID、网站和会话标记，不自动切换到当前页或同网址页面。
+
+验证共 13 项通过：browser-profiles 6、profile-connector 2、batch-ui 1、chrome-bridge 2、desktop 1、groups-ui 1。主进程/UI 类型检查、Vite UI 构建、扩展构建及 git diff --check 通过。
+
+- 两个真实 Chrome for Testing 配置各打开 3 个同网址页面和 2 个窗口。配置页关闭后仍可连接；两个 Profile 各执行一次官方点击、文本断言并生成报告，其他页面未收到动作。断开一个后不会转接其他 Profile，另一连接仍正常；Cookie 和 localStorage 保留。证据：artifacts/profile-connector-YhFMKY/observations.json。
+- 真实 Electron 验证配对提示、复制入口、窗口目录、精确选择参数、断开后隐藏旧列表、重试、解除配对、新选择成为默认值并保留逐例指定，以及 Group 新选择立即生效。界面截图 artifacts/batch-ui-sUG7ZR/chrome-tab-picker.png 和 profile-pairing.png 已视觉检查。UI 使用隔离 API fixture，真实连接由上一项覆盖。
+- 后端使用真实 SDK server 和子进程验证跨 Profile 重复 tabId 拒绝、错误配对拒绝、端口释放、取消恢复及错误消息隐藏 token。30 秒硬截止由代码实现；本轮验证取消清理，没有等待完整 30 秒超时。
+- 原有官方录制回放、桌面项目/用例/报告/历史、新 Profile 的真实 IPC 创建与解除、1000+ 分组和 React Flow 交互均通过。
+
+未安装扩展到日常 Chrome，也未运行真实 Longbridge 账号业务。只展示已配对 Profile，名称由用户设置。目录是检查时快照，应用重启后需要重新配对。首次使用需在目标 Profile 加载 dist-browser-extension/。
