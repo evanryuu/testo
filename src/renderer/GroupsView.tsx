@@ -39,9 +39,9 @@ function GroupEditor({ project, initial, close, refresh, saved }: { project: Pro
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { working.current = false; setBusy(false); }
   }
-  return <Dialog open onOpenChange={open => { if (!open && !busy) close(); }}><DialogContent showCloseButton={false} className="max-h-[92vh] overflow-hidden sm:max-w-5xl" onInteractOutside={event => event.preventDefault()}>
-    <DialogHeader><DialogTitle>{draft.id ? '编辑分组' : '新建分组'}</DialogTitle><DialogDescription>一个用例可以加入多个分组。成员顺序决定该分组的执行顺序。</DialogDescription></DialogHeader>
-    <div className="min-h-0 space-y-4 overflow-y-auto pr-1">
+  return <Dialog open onOpenChange={open => { if (!open && !busy) close(); }}><DialogContent showCloseButton={false} className="flex max-h-[92dvh] flex-col overflow-hidden sm:max-w-5xl" onInteractOutside={event => event.preventDefault()}>
+    <DialogHeader className="shrink-0"><DialogTitle>{draft.id ? '编辑分组' : '新建分组'}</DialogTitle><DialogDescription>一个用例可以加入多个分组。成员顺序决定该分组的执行顺序。</DialogDescription></DialogHeader>
+    <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain pr-1">
       <div className="grid gap-3 sm:grid-cols-2"><label className="space-y-2 text-sm"><span>分组名称</span><Input aria-label="分组名称" value={draft.name} disabled={busy} onChange={event => setDraft({ ...draft, name: event.target.value })} /></label><label className="space-y-2 text-sm"><span>分组说明</span><Textarea rows={2} aria-label="分组说明" value={draft.description} disabled={busy} onChange={event => setDraft({ ...draft, description: event.target.value })} /></label></div>
       {error ? <Alert variant="destructive"><AlertDescription>{error} 输入内容已保留。</AlertDescription></Alert> : null}
       <div className="grid gap-4 lg:grid-cols-2">
@@ -58,7 +58,7 @@ function GroupEditor({ project, initial, close, refresh, saved }: { project: Pro
         })}{!draft.caseIds.length ? <p className="p-4 text-xs text-muted-foreground">从左侧选择用例。空分组可以保存，但不能运行。</p> : null}</div><Pager label="已选成员" page={currentSelectedPage} count={draft.caseIds.length} change={setSelectedPage} /></div>
       </div>
     </div>
-    <DialogFooter><Button variant="outline" disabled={busy} onClick={close}>取消编辑</Button><Button disabled={busy || !draft.name.trim()} onClick={() => void save()}>保存分组</Button></DialogFooter>
+    <DialogFooter className="shrink-0 border-t bg-background pt-4"><Button variant="outline" disabled={busy} onClick={close}>取消编辑</Button><Button disabled={busy || !draft.name.trim()} onClick={() => void save()}>保存分组</Button></DialogFooter>
   </DialogContent></Dialog>;
 }
 

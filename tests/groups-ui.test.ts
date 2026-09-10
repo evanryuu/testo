@@ -53,6 +53,43 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
     await expect(page.getByTestId('group-list-row').first()).toHaveAttribute('data-group-id', 'g50');
     await page.getByRole('button', { name: '分组列表上一页', exact: true }).click();
 
+    // Small windows keep the edit actions visible while the form scrolls.
+    for (const [width, height] of [[1100, 620], [800, 560]]) {
+      await app.evaluate(({ BrowserWindow }, size) => {
+        const window = BrowserWindow.getAllWindows()[0]!;
+        window.setMinimumSize(0, 0); window.setContentSize(size[0]!, size[1]!);
+      }, [width!, height!]);
+      await page.getByRole('button', { name: '编辑分组 分组0001', exact: true }).click();
+      const dialog = page.getByRole('dialog');
+      await dialog.evaluate(async element => { await Promise.all(element.getAnimations().map(animation => animation.finished)); });
+      const body = dialog.locator(':scope > div').nth(1);
+      const save = dialog.getByRole('button', { name: '保存分组', exact: true });
+      const cancel = dialog.getByRole('button', { name: '取消编辑', exact: true });
+      await page.getByLabel('分组说明', { exact: true }).fill('小屏保存 ' + width);
+      await page.screenshot({ path: path.join(data, 'group-small-' + width + '-before.png') });
+      for (const button of [save, cancel]) {
+        assert.equal(await button.evaluate(element => {
+          const box = element.getBoundingClientRect();
+          return box.top >= 0 && box.bottom <= innerHeight
+            && element.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
+        }), true, 'edit actions must be fully visible and clickable without scrolling');
+      }
+      const footerY = (await save.boundingBox())!.y;
+      const bounds = (await body.boundingBox())!;
+      await page.mouse.move(bounds.x + bounds.width - 3, bounds.y + bounds.height / 2);
+      await page.mouse.wheel(0, 1200);
+      await expect.poll(() => body.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+      assert.ok(Math.abs((await save.boundingBox())!.y - footerY) < 2, 'footer stays in place as the form scrolls');
+      await page.screenshot({ path: path.join(data, 'group-small-' + width + '-scrolled.png') });
+      await save.click();
+      await expect(dialog).toHaveCount(0);
+      assert.equal(await app.evaluate(() => (globalThis as any).groupsFixture.projects[0].groups.find((group: any) => group.id === 'g1').description), '小屏保存 ' + width);
+      await page.getByRole('button', { name: '编辑分组 分组0001', exact: true }).click();
+      await expect(page.getByLabel('分组说明', { exact: true })).toHaveValue('小屏保存 ' + width);
+      await page.getByRole('button', { name: '取消编辑', exact: true }).click();
+    }
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setContentSize(1380, 900));
+
     // Invalid groups explain why execution is unavailable.
     for (const [name, reason] of [['分组0002', '是空分组'], ['分组0003', '缺失用例'], ['分组0004', '尚无可运行的 Web']]) {
       await page.getByLabel('选择分组 ' + name, { exact: true }).check();
