@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { expect } from '@playwright/test';
-import { _electron as electron, type ElectronApplication } from 'playwright';
+import { _electron as electron, type ElectronApplication, type Locator } from 'playwright';
 
 test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation and ordered multi-group runs', { timeout: 90000 }, async () => {
   mkdirSync('artifacts', { recursive: true });
@@ -19,7 +19,7 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
       cases.push({ id: 'mobile', name: '移动端用例', description: '', suiteId: 'a', priority: 'P1', tags: [], revision: '1', workflows: [{ id: 'mobile-w', platform: 'android', definitionPath: 'android.yaml', ready: true }] });
       const groups = Array.from({ length: 1005 }, (_, index) => ({ id: 'g' + index, name: '分组' + String(index).padStart(4, '0'), description: '', caseIds: index === 0 ? cases.slice(0, 1005).map(item => item.id) : index === 1 ? ['c1', 'c2'] : ['c' + index], revision: '1' }));
       groups[2]!.caseIds = []; groups[3]!.caseIds = ['missing']; groups[4]!.caseIds = ['mobile'];
-      const state: any = { projects: [{ id: 'p', name: 'Groups fixture', description: '', root: '/local/fixture', suites: [{ id: 'a', name: 'Suite A', directory: 'a' }, { id: 'b', name: 'Suite B', directory: 'b' }], cases, groups, environments: [{ id: 'env', name: 'Local', web: { baseUrl: 'http://127.0.0.1:43210' } }], errors: [] }], runs: [], batches: [], sessions: [{ id: 's', name: '窗口 A', projectId: 'p', environmentId: 'env', origin: 'http://127.0.0.1:43210' }], model: { name: '', family: '', baseUrl: '', hasApiKey: false }, errors: [] };
+      const state: any = { projects: [{ id: 'p', name: 'Groups fixture', description: '', root: '/local/fixture', suites: [{ id: 'a', name: 'Suite A', directory: 'a' }, { id: 'b', name: 'Suite B', directory: 'b' }, ...Array.from({ length: 30 }, (_, index) => ({ id: 'suite-' + index, name: 'Extra Suite ' + index, directory: 'extra-' + index }))], cases, groups, environments: [{ id: 'env', name: 'Local', web: { baseUrl: 'http://127.0.0.1:43210' } }], errors: [] }], runs: [], batches: [], sessions: [{ id: 's', name: '窗口 A', projectId: 'p', environmentId: 'env', origin: 'http://127.0.0.1:43210' }], model: { name: '', family: '', baseUrl: '', hasApiKey: false }, errors: [] };
       (globalThis as any).groupsFixture = state; (globalThis as any).groupsCalls = []; (globalThis as any).groupConflict = false;
       ipcMain.removeHandler('workspace:call');
       ipcMain.handle('workspace:call', async (_event, method, input) => {
@@ -53,6 +53,45 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
     await expect(page.getByTestId('group-list-row').first()).toHaveAttribute('data-group-id', 'g50');
     await page.getByRole('button', { name: '分组列表上一页', exact: true }).click();
 
+    async function checkOverlay(area: Locator, axis: 'x' | 'y') {
+      const scrollbar = area.locator(':scope > .os-scrollbar-' + (axis === 'y' ? 'vertical' : 'horizontal'));
+      await page.getByRole('button', { name: '刷新', exact: true }).hover();
+      await expect(scrollbar).toHaveCSS('opacity', '0');
+      const dimensions = await area.evaluate(element => ({ width: element.clientWidth, height: element.clientHeight }));
+      assert.equal(await area.evaluate((element, axis) => {
+        if (!(element instanceof HTMLElement)) throw new Error('Expected an HTML scroll area');
+        const style = getComputedStyle(element);
+        return axis === 'y'
+          ? element.offsetWidth - element.clientWidth - parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth)
+          : element.offsetHeight - element.clientHeight - parseFloat(style.borderTopWidth) - parseFloat(style.borderBottomWidth);
+      }, axis), 0, 'scrollbars do not reserve a layout gutter');
+      await area.hover();
+      await expect(scrollbar).toHaveCSS('opacity', '1');
+      assert.deepEqual(await area.evaluate(element => ({ width: element.clientWidth, height: element.clientHeight })), dimensions);
+      const handle = await scrollbar.locator('.os-scrollbar-handle').boundingBox();
+      assert.ok(handle);
+      const initial = await area.evaluate((element, axis) => axis === 'y' ? element.scrollTop : element.scrollLeft, axis);
+      await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(handle.x + handle.width / 2 + (axis === 'x' ? 40 : 0), handle.y + handle.height / 2 + (axis === 'y' ? 40 : 0), { steps: 8 });
+      await page.mouse.up();
+      await expect.poll(() => area.evaluate((element, axis) => axis === 'y' ? element.scrollTop : element.scrollLeft, axis)).toBeGreaterThan(initial);
+      await page.getByRole('button', { name: '刷新', exact: true }).hover();
+      await expect(scrollbar).toHaveCSS('opacity', '0');
+    }
+    const sidebar = page.locator('aside [data-overlayscrollbars]');
+    await checkOverlay(sidebar, 'y');
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.screenshot({ path: path.join(data, 'scrollbars-hidden.png') });
+    await sidebar.hover();
+    await expect(sidebar.locator(':scope > .os-scrollbar-vertical')).toHaveCSS('opacity', '1');
+    await page.screenshot({ path: path.join(data, 'scrollbars-hover.png') });
+
+    await sidebar.getByRole('button').nth(2).focus();
+    const beforeKey = await sidebar.evaluate(element => element.scrollTop);
+    await page.keyboard.press('PageDown');
+    await expect.poll(() => sidebar.evaluate(element => element.scrollTop)).toBeGreaterThan(beforeKey);
+
     // Small windows keep the edit actions visible while the form scrolls.
     for (const [width, height] of [[1100, 620], [800, 560]]) {
       await app.evaluate(({ BrowserWindow }, size) => {
@@ -65,7 +104,25 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
       const body = dialog.locator(':scope > div').nth(1);
       const save = dialog.getByRole('button', { name: '保存分组', exact: true });
       const cancel = dialog.getByRole('button', { name: '取消编辑', exact: true });
-      await page.getByLabel('分组说明', { exact: true }).fill('小屏保存 ' + width);
+      const description = page.getByLabel('分组说明', { exact: true });
+      if (width === 1100) {
+        // A user-resized textarea retains native typing and scrolling.
+        await description.evaluate(element => { element.style.height = '72px'; element.style.setProperty('field-sizing', 'fixed'); });
+        await description.fill(Array.from({ length: 60 }, (_, index) => 'Description line ' + index).join('\n'));
+        const textareaBar = description.locator('..').locator(':scope > .os-scrollbar-vertical');
+        await dialog.getByRole('heading', { name: '编辑分组', exact: true }).hover();
+        await expect(textareaBar).toHaveCSS('opacity', '0');
+        await description.hover();
+        await expect(textareaBar).toHaveCSS('opacity', '1');
+        await description.evaluate(element => { element.scrollTop = 0; });
+        await page.mouse.wheel(0, 250);
+        await expect.poll(() => description.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+        assert.equal(await description.evaluate(element => {
+          const style = getComputedStyle(element);
+          return (element as HTMLElement).offsetWidth - element.clientWidth - parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth);
+        }), 0);
+      }
+      await description.fill('小屏保存 ' + width);
       await page.screenshot({ path: path.join(data, 'group-small-' + width + '-before.png') });
       for (const button of [save, cancel]) {
         assert.equal(await button.evaluate(element => {
@@ -74,6 +131,13 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
             && element.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
         }), true, 'edit actions must be fully visible and clickable without scrolling');
       }
+      const outerScroll = body.locator(':scope > .os-scrollbar-vertical');
+      await dialog.getByRole('heading', { name: '编辑分组', exact: true }).hover();
+      await expect(outerScroll).toHaveCSS('opacity', '0');
+      const bodyWidth = await body.evaluate(element => element.clientWidth);
+      await body.hover();
+      await expect(outerScroll).toHaveCSS('opacity', '1');
+      assert.equal(await body.evaluate(element => element.clientWidth), bodyWidth);
       const footerY = (await save.boundingBox())!.y;
       const bounds = (await body.boundingBox())!;
       await page.mouse.move(bounds.x + bounds.width - 3, bounds.y + bounds.height / 2);
@@ -89,6 +153,15 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
       await page.getByRole('button', { name: '取消编辑', exact: true }).click();
     }
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setContentSize(1380, 900));
+
+    await page.getByRole('button', { name: 'Test Cases', exact: false }).click();
+    const suiteTabs = page.getByRole('tablist').locator('..');
+    await checkOverlay(suiteTabs, 'x');
+    const headerTop = await page.locator('header').evaluate(element => element.getBoundingClientRect().top);
+    await page.mouse.move(1000, 600); await page.mouse.wheel(0, 700);
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+    assert.equal(await page.locator('header').evaluate(element => element.getBoundingClientRect().top), headerTop, 'document scrollbar preserves the sticky header');
+    await page.getByRole('button', { name: 'Groups', exact: true }).click();
 
     // Invalid groups explain why execution is unavailable.
     for (const [name, reason] of [['分组0002', '是空分组'], ['分组0003', '缺失用例'], ['分组0004', '尚无可运行的 Web']]) {
@@ -238,6 +311,25 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
     await created.getByRole('checkbox').check();
     await created.getByRole('checkbox').uncheck();
     await page.getByTestId('group-graph-canvas').screenshot({ path: path.join(data, 'graph-group-created.png') });
+    await app.evaluate(({ BrowserWindow }) => {
+      (globalThis as any).groupsFixture.runs = [{ runId: 'scroll-log', projectId: 'p', caseId: 'c0', caseName: '滚动日志验证', environment: 'Local', status: 'passed', startedAt: new Date().toISOString(), events: Array.from({ length: 80 }, (_, index) => ({ type: 'browser-started', pid: index })) }];
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send('workspace:changed');
+    });
+    await page.getByRole('button', { name: 'Run History', exact: true }).click();
+    await page.getByRole('button', { name: /滚动日志验证/ }).click();
+    await page.getByRole('tab', { name: '运行事件', exact: true }).click();
+    const logs = page.locator('pre[data-overlayscrollbars]');
+    await checkOverlay(logs, 'y');
+    await app.evaluate(({ BrowserWindow }) => {
+      (globalThis as any).groupsFixture.runs[0].events.push({ type: 'browser-started', pid: 9999 });
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send('workspace:changed');
+    });
+    await expect(logs.locator('code')).toContainText('9999');
+    await expect(logs.locator(':scope > .os-scrollbar')).toHaveCount(2);
+    await page.getByRole('button', { name: 'Groups', exact: true }).click();
+    await expect(page.locator('body > .os-scrollbar')).toHaveCount(2);
+    await expect(page.locator('aside .os-scrollbar')).toHaveCount(2);
+    await expect(page.locator('textarea')).toHaveCount(0);
     assert.deepEqual(errors, []);
     console.log('Groups UI evidence:', data);
   } finally { await app?.close(); }

@@ -1,3 +1,4 @@
+import { attachOverlayScrollbars } from '@/lib/scrollbars';
 import { useEffect, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Check, Code2, Globe2, ImageIcon, LoaderCircle, Plus, RotateCw, Square, X } from 'lucide-react';
 import { getMidsceneRecorderEventDescription } from '@midscene/shared/recorder';
@@ -30,7 +31,7 @@ function EventDetails({ event, recordingId, close }: { event?: RecordedEvent; re
     return () => { disposed = true; };
   }, [event?.hashId, recordingId]);
   return <Dialog open={!!event} onOpenChange={(open) => { if (!open) close(); }}>
-    <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-5xl">
+    <DialogContent ref={attachOverlayScrollbars} className="max-h-[90vh] overflow-y-auto sm:max-w-5xl">
       <DialogHeader><DialogTitle>录制事件截图</DialogTitle><DialogDescription className="break-all">{event ? label(event) : ''}</DialogDescription></DialogHeader>
       {screenshot ? <div className="relative overflow-hidden rounded-lg border">
         <img src={screenshot} alt="录制事件截图" className="block w-full" />
@@ -208,7 +209,7 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
           <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={busy || staleSteps} onClick={() => addCheck('wait', insertAt)}>插入等待条件</Button><Button size="sm" variant="outline" disabled={busy || staleSteps} onClick={() => addCheck('text', insertAt)}>插入断言</Button></div>
           <p className="text-xs leading-5 text-muted-foreground">按 Timeline 顺序执行。等待只重新检查当前页面，不会重复前面的操作。</p>
         </div> : null}
-        <CardContent className="max-h-[640px] overflow-y-auto p-0">{timelineSteps.length ? timelineSteps.map((step, index) => {
+        <CardContent ref={attachOverlayScrollbars} className="max-h-[640px] overflow-y-auto p-0">{timelineSteps.length ? timelineSteps.map((step, index) => {
           if (step.kind === 'check') {
             const assertion = step.assertion, number = checks.findIndex(check => check.id === step.id) + 1;
             return <div key={step.id} data-review-step={step.id} data-review-check={step.id} className="space-y-3 border-b bg-muted/30 px-5 py-4 last:border-b-0">
@@ -257,7 +258,7 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
               {semantic?.elementDescription ? <p>目标：{semantic.elementDescription}</p> : null}
               {semantic?.replayInstruction ? <p>回放描述：{semantic.replayInstruction}</p> : null}
               {event.mergedHashIds?.length ? <p>已合并 {event.mergedHashIds.length} 个输入片段</p> : null}
-              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2">{JSON.stringify({ actionType: event.actionType, source: event.source, rawPayload: event.rawPayload, pageInfo: event.pageInfo, elementRect: event.elementRect }, null, 2)}</pre>
+              <pre ref={attachOverlayScrollbars} className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2"><code>{JSON.stringify({ actionType: event.actionType, source: event.source, rawPayload: event.rawPayload, pageInfo: event.pageInfo, elementRect: event.elementRect }, null, 2)}</code></pre>
             </div></details>
           </div>;
         }) : <p className="px-5 py-8 text-sm leading-6 text-muted-foreground">{active ? '点击网页、输入文字或滚动后，步骤会显示在这里。' : '尚未采集操作。至少录制一个操作后才能保存。'}</p>}</CardContent>
@@ -268,7 +269,7 @@ export function RecordingView({ draft, refresh, done }: { draft: RecordingDraft;
       <CardContent className="space-y-2 text-xs leading-6 text-muted-foreground"><p>快捷添加会放在 Timeline 末尾。你也可以在 Timeline 选择任意位置插入，并用上下按钮调整检查的位置。</p><p>等待条件和 AI 断言使用 Model Settings 中的配置；等待条件满足后立即继续，AI 断言只检查当时的页面。</p></CardContent>
     </Card> : null}
     <EventDetails event={selectedEvent} recordingId={draft.id} close={() => setSelectedEvent(undefined)} />
-    {yaml ? <Card className="min-w-0"><CardHeader><CardTitle className="text-base">Workflow 预览</CardTitle></CardHeader><CardContent><pre className="max-h-96 overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-6" aria-label="生成的 Workflow YAML">{yaml}</pre></CardContent></Card> : null}
+    {yaml ? <Card className="min-w-0"><CardHeader><CardTitle className="text-base">Workflow 预览</CardTitle></CardHeader><CardContent><pre ref={attachOverlayScrollbars} className="max-h-96 overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-6" aria-label="生成的 Workflow YAML"><code>{yaml}</code></pre></CardContent></Card> : null}
     <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 border-t bg-background/95 py-4 backdrop-blur-sm">
       <div className="flex flex-wrap items-center gap-2">{confirmDiscard ? <>
         <span className="text-sm text-muted-foreground">放弃当前草稿，已保存的 Workflow 保持不变。</span>
