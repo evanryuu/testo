@@ -102,7 +102,7 @@ test('desktop creates assets, runs real workflows, opens report and restores his
     await page.getByRole('dialog').waitFor({ state: 'hidden' });
     await page.getByLabel('浏览器会话', { exact: true }).selectOption('bridge');
     await expect(page.getByRole('button', { name: '运行', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: '连接 Chrome', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '连接 Chrome', exact: true })).toBeEnabled();
     await page.getByLabel('浏览器会话', { exact: true }).selectOption('isolated');
     await page.getByLabel('运行数据集', { exact: true }).selectOption({ label: 'Chinese row' });
     await page.getByRole('region', { name: '运行变量', exact: true }).getByRole('button', { name: '添加变量', exact: true }).click();
