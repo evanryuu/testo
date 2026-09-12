@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import { test } from 'node:test';
 import { RecorderEvents } from '../src/recording/events.js';
@@ -97,7 +98,7 @@ test('a stalled model becomes a failed description and releases the stopped reco
   let finished!: () => void;
   const idle = new Promise<void>((resolve) => { finished = resolve; });
   const events = new RecorderEvents({
-    persistScreenshot: async () => {}, describe: () => new Promise(() => {}),
+    persistScreenshot: async () => {}, describe: (_event, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
     changed() {}, idle: finished, descriptionTimeoutMs: 20,
   });
   await events.update([event('slow')]);
@@ -123,4 +124,93 @@ test('upstream ready descriptions without verification still enter the verificat
   await events.update([input]); await drain();
   assert.equal(calls, 1, 'polling does not repeatedly schedule the same event');
   events.close();
+});
+
+
+test('timeouts and cancellation keep the actual description concurrency bounded until termination', async () => {
+  let active = 0, maximum = 0, cancelled = 0, completed = 0;
+  let resolveIdle!: () => void;
+  const idle = new Promise<void>(resolve => { resolveIdle = resolve; });
+  const events = new RecorderEvents({
+    persistScreenshot: async () => {}, changed() {}, idle: resolveIdle, descriptionTimeoutMs: 10,
+    describe: (_event, signal) => new Promise((_, reject) => {
+      active++; maximum = Math.max(maximum, active);
+      signal.addEventListener('abort', () => {
+        cancelled++;
+        // Model transport takes time to close. That period still occupies a slot.
+        setTimeout(() => { active--; completed++; reject(signal.reason); }, 35);
+      }, { once: true });
+    }),
+  });
+  await events.update(['one', 'two', 'three', 'four'].map(event));
+  await idle;
+  assert.equal(maximum, 2);
+  assert.equal(active, 0);
+  assert.equal(cancelled, 4);
+  assert.equal(completed, 4);
+  assert.equal(events.pending, 0);
+  assert.ok(events.values.every(item => item.semantic?.status === 'failed'));
+  assert.deepEqual(events.values.map(item => item.rawPayload), Array(4).fill(event('x').rawPayload));
+  events.close();
+});
+
+test('closing cancels active descriptions, discards queued work, and preserves every raw event', async () => {
+  let active = 0, started = 0;
+  const events = new RecorderEvents({
+    persistScreenshot: async () => {}, changed() {}, idle() {},
+    describe: (_event, signal) => new Promise((_, reject) => {
+      active++; started++;
+      signal.addEventListener('abort', () => { active--; reject(signal.reason); }, { once: true });
+    }),
+  });
+  await events.update(['one', 'two', 'three'].map(event));
+  await drain();
+  events.close(); await drain();
+  assert.equal(active, 0); assert.equal(started, 2); assert.equal(events.pending, 0);
+  assert.equal(events.values.length, 3);
+  assert.ok(events.values.every(item => item.semantic?.status === 'failed' && item.value === 'hi'));
+});
+
+
+test('official recorder keeps the pre-action send target when the click immediately replaces the page', { timeout: 45000 }, async () => {
+  const server = createServer((_request, response) => {
+    response.setHeader('Content-Type', 'text/html');
+    response.end(`<!doctype html><input aria-label="Message" value="private input" style="position:absolute;left:20px;top:20px;width:200px;height:40px"><button data-testid="send-message" aria-label="Send" style="position:absolute;left:250px;top:20px;width:120px;height:40px" onclick="document.body.innerHTML='<aside>Different history chat</aside>';history.pushState({},'', '/conversation')">Send</button>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const root = mkdtempSync(path.join(tmpdir(), 'workspace-target-before-'));
+  const service = new RecordingService(root, () => {});
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('MIDSCENE_MODEL') && !key.startsWith('OPENAI_')));
+  try {
+    const id = await service.start({ projectId: 'p', caseId: 'c', workflowId: 'w', caseName: 'Send', environmentId: 'local', baseUrl: `http://127.0.0.1:${address.port}`, revision: 'r', replace: { revision: 'r', start: 2, deleteCount: 1, originalText: 'steps: []' } }, environment);
+    await service.interact(id, { actionType: 'Tap', x: 50, y: 35 });
+    await service.interact(id, { actionType: 'Tap', x: 275, y: 35 });
+    await service.stop(id);
+    const taps = service.draft!.events.filter(item => item.actionType === 'Tap');
+    assert.equal(taps.length, 2);
+    assert.deepEqual(taps[0]!.target, { tag: 'input', role: 'textbox', name: 'Message' });
+    assert.deepEqual(taps[1]!.target, { tag: 'button', role: 'button', name: 'Send', testId: 'send-message' });
+    assert.deepEqual(taps[1]!.rawPayload, { actionType: 'Tap', x: 275, y: 35 });
+    assert.doesNotMatch(JSON.stringify(taps.map(item => item.target)), /private input|Different history chat/);
+    assert.deepEqual(service.draft!.replace, { revision: 'r', start: 2, deleteCount: 1, originalText: 'steps: []' });
+  } finally {
+    await service.shutdown();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+
+test('recording persistence protects active and archived profile bindings and decodes them on restart', t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'workspace-recording-protected-'));
+  const draft: RecordingDraft = { id: 'protected', projectId: 'p', caseId: 'c', workflowId: 'w', caseName: 'Protected recording', environmentId: 'local', baseUrl: 'https://example.test', revision: 'r', status: 'review', events: [], createdAt: new Date().toISOString(), chromeTarget: { tabId: '42', origin: 'https://example.test', profile: { connectorId: 'p', port: 13788, connectionToken: 'private-pairing-token', profileInstallationId: 'work-profile' } } };
+  const protectedValues = new Map<string, string>();
+  const persistence = { encode(text: string) { const key = `encrypted-${protectedValues.size}`; protectedValues.set(key, text); return key; }, decode(text: string) { return protectedValues.get(text) ?? text; } };
+  writeFileSync(path.join(root, 'recording-draft.json'), JSON.stringify(draft));
+  const service = new RecordingService(root, () => {}, persistence);
+  service.saved(draft.id);
+  for (const file of ['recording-draft.json', 'recordings/protected/draft.json']) assert.doesNotMatch(readFileSync(path.join(root, file), 'utf8'), /private-pairing-token/);
+  const restored = new RecordingService(root, () => {}, persistence);
+  assert.deepEqual(restored.draft!.chromeTarget, draft.chromeTarget);
 });

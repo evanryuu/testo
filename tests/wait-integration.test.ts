@@ -236,6 +236,7 @@ test('Electron Timeline inserts, moves, removes and restores checks between reco
     const state = await page.evaluate(() => window.workspace.state());
     assert.equal(state.recording?.status, 'saved');
     await page.getByRole('button', { name: '查看 / 编辑', exact: true }).click();
+    await page.getByRole('tab', { name: 'YAML', exact: true }).click();
     assert.deepEqual(parse(await page.getByLabel('Workflow YAML', { exact: true }).inputValue()), parse(yaml), 'saved workflow reloads through the actual editor');
     await page.screenshot({ path: path.join(data, 'saved-waits.png') });
     assert.deepEqual(errors, []);

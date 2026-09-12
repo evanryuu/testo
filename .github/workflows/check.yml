@@ -1,0 +1,25 @@
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-14
+    env:
+      ALLOW_HEAVY: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install chromium
+      - run: npm run build:desktop
+      - run: node --test --test-concurrency=1 dist/tests/workspace.test.js dist/tests/workflow-document.test.js dist/tests/execution-features.test.js dist/tests/project-features.test.js dist/tests/cli-project.test.js dist/tests/report-bundle.test.js
+      - run: npm run test:desktop

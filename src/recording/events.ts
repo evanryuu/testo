@@ -8,10 +8,11 @@ export class RecorderEvents {
   private jobs: { event: RecordedEvent; version: string }[] = [];
   private running = 0;
   private closed = false;
-  private timers = new Set<ReturnType<typeof setTimeout>>();
+  private controllers = new Set<AbortController>();
   constructor(private options: {
     persistScreenshot(event: RecordedEvent): Promise<void>;
-    describe(event: RecordedEvent): Promise<RecordedEvent>;
+    // A cancelled call must settle only after its underlying work has stopped.
+    describe(event: RecordedEvent, signal: AbortSignal): Promise<RecordedEvent>;
     changed(events: RecordedEvent[]): void;
     idle(): void;
     descriptionTimeoutMs?: number;
@@ -42,16 +43,24 @@ export class RecorderEvents {
     if (changed) this.options.changed(this.values);
     this.pump();
   }
-  close() { this.closed = true; this.jobs = []; for (const timer of this.timers) clearTimeout(timer); this.timers.clear(); }
+  close() {
+    this.closed = true; this.jobs = [];
+    for (const controller of this.controllers) controller.abort(new Error('描述生成已取消'));
+    for (const [id, event] of this.entries) if (event.semantic?.status === 'pending') this.entries.set(id, { ...event, semantic: { source: 'aiDescribe', status: 'failed', error: '描述生成已取消，原始操作和截图已保留' }, descriptionLoading: false });
+    this.options.changed(this.values);
+  }
   private pump() {
     while (!this.closed && this.running < 2 && this.jobs.length) {
       const job = this.jobs.shift()!;
       if (this.versions.get(job.event.hashId) !== job.version) continue;
       this.running++;
-      let timer: ReturnType<typeof setTimeout>;
-      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('描述生成超时')), this.options.descriptionTimeoutMs ?? 90_000); });
-      this.timers.add(timer!);
-      void Promise.race([Promise.resolve().then(() => this.options.describe(job.event)), timeout]).then((described) => {
+      const controller = new AbortController();
+      this.controllers.add(controller);
+      const timer = setTimeout(() => controller.abort(new Error('描述生成超时')), this.options.descriptionTimeoutMs ?? 90_000);
+      // Do not race the request against a timer. Aborting terminates its worker;
+      // its promise settles on process close before the next task can start.
+      void Promise.resolve().then(() => this.options.describe(job.event, controller.signal)).then((described) => {
+        controller.signal.throwIfAborted();
         if (!this.closed && this.versions.get(job.event.hashId) === job.version) {
           // Only description fields may change; coordinates, merged input and
           // screenshot references continue to come from the official recording.
@@ -64,7 +73,7 @@ export class RecorderEvents {
         }
       }).finally(() => {
         clearTimeout(timer);
-        this.timers.delete(timer);
+        this.controllers.delete(controller);
         this.running--;
         if (this.closed) return;
         this.options.changed(this.values);

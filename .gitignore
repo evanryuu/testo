@@ -10,3 +10,4 @@ dist-preview/
 midscene_run/
 .DS_Store
 dist-browser-extension/
+release/

@@ -110,7 +110,7 @@ test('rejects multiple Cases instead of silently running unrelated tests', { tim
   const events: WorkerEvent[] = [];
   const result = await start('multiple.yaml', events).result;
   assert.equal(result.status, 'error');
-  assert.match(result.error!, /exactly one/);
+  assert.match(result.error!, /每个平台 Workflow 必须包含一个用例/);
   assert.ok(!events.some((e) => e.type === 'browser-started'));
 });
 

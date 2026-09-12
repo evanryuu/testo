@@ -15,7 +15,7 @@ function fixture(t: { after(fn: () => void): void }, patch: Partial<RecordingDra
 }
 
 test('retry preserves the draft and existing workflow, discarding only stale connection state', async t => {
-  const { service, dir, draft } = fixture(t, { startUrl: 'https://example.com/old', viewport: { width: 1920, height: 902 } });
+  const { service, dir, draft } = fixture(t, { startUrl: 'https://example.com/old', viewport: { width: 1920, height: 902 }, chromeTarget: { tabId: '42', origin: 'https://example.com', profile: { connectorId: 'work', port: 13788, connectionToken: 'private-pairing-token', profileInstallationId: 'profile-A' } } });
   let launches = 0;
   t.mock.method(service as any, 'launchWorker', async () => { launches++; service.draft!.status = 'ready'; return service.draft!.id; });
   assert.equal(await service.retry(draft.id), draft.id);
@@ -27,6 +27,7 @@ test('retry preserves the draft and existing workflow, discarding only stale con
   assert.equal(service.draft!.error, undefined);
   assert.equal(service.draft!.startUrl, undefined);
   assert.equal(service.draft!.viewport, undefined);
+  assert.deepEqual(service.draft!.chromeTarget, draft.chromeTarget, 'retry must retain the explicit profile/tab binding');
   assert.equal(JSON.parse(readFileSync(path.join(dir, 'recording-preview.json'), 'utf8')), null);
 });
 

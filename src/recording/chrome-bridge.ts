@@ -107,7 +107,12 @@ export async function connectChrome(agent: AgentOverChromeBridge, origin: string
     if (target && String(tabId) !== target.tabId) throw new Error('连接的 Chrome 标签页与已确认会话不一致');
     return { tabId: String(tabId), origin, ...(target?.profile ? { profile: { ...target.profile } } : {}) };
   } catch (error) {
-    throw new Error(`连接 Chrome 失败：${error instanceof Error ? error.message : String(error)}。请确认已安装并允许 Midscene 扩展的 Bridge 连接，且没有其他 Midscene 会话占用连接。`);
+    const detail = error instanceof Error ? error.message : String(error);
+    const message = target?.profile ? detail.replaceAll(target.profile.connectionToken, '[已隐藏]') : detail;
+    const guidance = target?.profile
+      ? '请在所选 Chrome Profile 中检查 Testo 扩展连接，刷新标签页列表后重新选择；正在使用的连接需先结束。'
+      : '请确认已安装并允许 Midscene 扩展的 Bridge 连接，且没有其他 Midscene 会话占用连接。';
+    throw new Error(`连接 Chrome 失败：${message}。${guidance}`);
   }
 }
 

@@ -5,7 +5,8 @@ export function isRecordingDescriptionVerified(event: Pick<MidsceneRecorderEvent
   return event.semantic?.status === 'ready' && event.semantic.aiDescribe?.verifyPrompt === true && event.semantic.aiDescribe.verifyPassed === true;
 }
 
-export interface RecordedEvent extends MidsceneRecorderEvent { screenshotError?: string }
+export interface RecordedTarget { tag?: string; role?: string; name?: string; testId?: string }
+export interface RecordedEvent extends MidsceneRecorderEvent { screenshotError?: string; target?: RecordedTarget }
 export interface RecordingDraft {
   id: string;
   projectId: string;
@@ -16,6 +17,7 @@ export interface RecordingDraft {
   baseUrl: string;
   revision: string;
   existingWorkflow?: boolean;
+  replace?: { revision: string; start: number; deleteCount: number; originalText: string };
   browserMode?: 'isolated' | 'bridge';
   chromeTarget?: ChromeTarget;
   viewport?: { width: number; height: number };

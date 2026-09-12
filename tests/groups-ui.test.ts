@@ -25,6 +25,11 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
       ipcMain.handle('workspace:call', async (_event, method, input) => {
         if (method === 'state') return { ok: true, value: state };
         if (method === 'browserProfiles') return { ok: true, value: [] };
+        if (method === 'history') {
+          const matching = state.runs.filter((run: any) => (!input.projectId || run.projectId === input.projectId) && (!input.caseId || run.caseId === input.caseId) && (!input.status || run.status === input.status) && (!input.environment || run.environment === input.environment));
+          return { ok: true, value: { runs: matching.slice(input.offset ?? 0, (input.offset ?? 0) + (input.limit ?? 50)).map((run: any) => ({ ...run, events: [] })), total: matching.length } };
+        }
+        if (method === 'runDetail') return { ok: true, value: state.runs.find((run: any) => run.runId === input.runId) };
         (globalThis as any).groupsCalls.push({ method, input });
         let value: any;
         if (method === 'saveGroup') {
@@ -263,7 +268,7 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
     await page.getByRole('button', { name: '开始批量运行', exact: true }).click();
     await expect(page.getByTestId('batch-results')).toBeVisible();
     const runInput = await app.evaluate(() => (globalThis as any).groupsCalls.find((call: any) => call.method === 'runGroups').input);
-    assert.deepEqual(runInput, { projectId: 'p', environmentId: 'env', failurePolicy: 'stop', sessionId: 's', groupIds: ['g1', 'created'] });
+    assert.deepEqual(runInput, { projectId: 'p', environmentId: 'env', failurePolicy: 'stop', sessionId: 's', groupIds: ['g1', 'created'], variables: {}, datasetIds: {}, loginCondition: '', dependent: false, timeoutMs: undefined });
     await page.screenshot({ path: path.join(data, 'groups-run.png') });
 
     await page.getByRole('button', { name: 'Groups', exact: true }).click();
@@ -322,7 +327,7 @@ test('Groups UI handles 1000+ entries, CRUD conflicts, bounded graph navigation 
     await checkOverlay(logs, 'y');
     await app.evaluate(({ BrowserWindow }) => {
       (globalThis as any).groupsFixture.runs[0].events.push({ type: 'browser-started', pid: 9999 });
-      for (const window of BrowserWindow.getAllWindows()) window.webContents.send('workspace:changed');
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send('workspace:run-changed', (globalThis as any).groupsFixture.runs[0]);
     });
     await expect(logs.locator('code')).toContainText('9999');
     await expect(logs.locator(':scope > .os-scrollbar')).toHaveCount(2);

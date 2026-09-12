@@ -5,6 +5,7 @@ import { findAvailablePort } from '@midscene/shared/node';
 import stdlib from 'node-stdlib-browser';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { createConnection } from 'node:net';
 import path from 'node:path';
 import { chromium, _electron as electron, type BrowserContext, type ElectronApplication, type Page } from 'playwright';
 import { expect } from '@playwright/test';
@@ -79,16 +80,47 @@ test('Chrome manual login stays outside recording; official Bridge records and r
       project = (await window.workspace.state()).projects.find(p => p.id === projectId)!;
       return { projectId, caseId, workflowId: project.cases[0]!.workflows[0]!.id, environmentId: project.environments[0]!.id };
     }, baseUrl);
+    const attach = async () => {
+      await expect.poll(() => new Promise<boolean>(resolve => {
+        const socket = createConnection({ host: '127.0.0.1', port: bridgePort });
+        const finish = (ready: boolean) => { socket.destroy(); resolve(ready); };
+        socket.setTimeout(300); socket.once('connect', () => finish(true));
+        socket.once('timeout', () => finish(false)); socket.once('error', () => finish(false));
+      })).toBeTruthy();
+      await extensionPage.evaluate(url => (window as any).attachBridge(url), `http://127.0.0.1:${bridgePort}`);
+    };
+    // The official Bridge fixture has no Profile catalog. Use the retained real
+    // capture API, then explicitly select that authenticated-tab binding in the UI.
+    const capture = async (page: Page) => {
+      await target.bringToFront();
+      const pending = page.evaluate(refs => window.workspace.captureSession({ projectId: refs.projectId, environmentId: refs.environmentId, name: '官方 Bridge 验证标签页' }), refs);
+      await attach();
+      return await pending;
+    };
+    // Current UI selects an already logged-in tab. Keep login entirely outside
+    // binding/recording, and verify the real extension has not attached a debugger.
+    assert.equal(await extensionPage.evaluate(() => (window as any).debuggerAttachCalls), 0);
+    await target.getByRole('button', { name: '手动登录', exact: true }).click();
+    await expect(target.getByRole('heading')).toHaveText('已登录');
+    assert.equal(await extensionPage.evaluate(() => (window as any).debuggerAttachCalls), 0);
+    const extensionHasDebugger = () => extensionPage.evaluate(async url => {
+      const api = (window as any).chrome.debugger;
+      const targets = await api.getTargets(), entry = targets.find((entry: any) => entry.tabId !== undefined && entry.url === url);
+      if (!entry) throw new Error('Fixture target missing from debugger catalog');
+      try { await api.sendCommand({ tabId: entry.tabId }, 'Runtime.evaluate', { expression: 'true' }); return true; }
+      catch (error) { if (/not attached/i.test(String(error))) return false; throw error; }
+    }, target.url());
+    assert.equal(await extensionHasDebugger(), false, 'manual login has no extension debugger');
+    let sessionId = await capture(ui);
+    await expect.poll(extensionHasDebugger).toBe(false);
     await ui.getByRole('button', { name: /Chrome 登录会话验证/ }).click();
     await ui.getByRole('button', { name: /已登录用户发送消息/ }).click();
     await ui.getByLabel('浏览器会话', { exact: true }).selectOption('bridge');
+    await ui.getByLabel('单例运行标签页', { exact: true }).selectOption(sessionId);
     await target.goto('about:blank');
     await ui.getByRole('button', { name: '连接 Chrome', exact: true }).click();
-    const attach = async () => {
-      await expect.poll(async () => { try { await fetch(`http://127.0.0.1:${bridgePort}`); return true; } catch { return false; } }).toBeTruthy();
-      await extensionPage.evaluate(url => (window as any).attachBridge(url), `http://127.0.0.1:${bridgePort}`);
-    };
     await attach();
+    await ui.getByRole('button', { name: '打开录制', exact: true }).click();
     await ui.getByRole('button', { name: '重新连接 Chrome', exact: true }).waitFor();
     const failedDraft = (await ui.evaluate(() => window.workspace.state())).recording!;
     assert.equal(failedDraft.status, 'interrupted');
@@ -103,10 +135,10 @@ test('Chrome manual login stays outside recording; official Bridge records and r
     assert.equal((await ui.evaluate(() => window.workspace.state())).recording!.error, undefined);
     assert.deepEqual((await ui.evaluate(() => window.workspace.state())).recording!.events, []);
     assert.equal(readFileSync(path.join(dir, 'app/recording-preview.json'), 'utf8'), 'null');
-    // Prepare must not attach the debugger: security verification happens manually first.
-    assert.equal(await extensionPage.evaluate(() => (window as any).debuggerAttachCalls), 0);
+    await expect.poll(extensionHasDebugger).toBe(false);
+    writeFileSync(path.join(dir, 'prepare-debugger-state.json'), JSON.stringify({ extensionAttached: await extensionHasDebugger(), targets: await extensionPage.evaluate(() => (window as any).chrome.debugger.getTargets()) }));
+    // The empty recording still excludes the manual login performed before binding.
     await ui.screenshot({ path: path.join(dir, 'prepare.png'), fullPage: true });
-    await target.getByRole('button', { name: '手动登录', exact: true }).click();
     await expect(target.getByRole('heading')).toHaveText('已登录');
     await ui.getByRole('button', { name: '已准备好，开始录制', exact: true }).click();
     const preview = ui.frameLocator('iframe[title="Midscene 官方录制预览"]');
@@ -184,9 +216,11 @@ test('Chrome manual login stays outside recording; official Bridge records and r
     await app.close();
     app = await electron.launch({ args: [root], env: { ...runtimeEnv(), MIDSCENE_MODEL_NAME: 'bridge-wait', MIDSCENE_MODEL_FAMILY: 'gpt-5', MIDSCENE_MODEL_BASE_URL: baseUrl + '/v1', MIDSCENE_MODEL_API_KEY: 'local-bridge-wait-key', MIDSCENE_MODEL_RETRY_COUNT: '0', WORKSPACE_DATA_DIR: path.join(dir, 'app'), WORKSPACE_PROJECTS_DIR: path.join(dir, 'projects') } });
     const reopened = await app.firstWindow(); reopened.setDefaultTimeout(15_000);
+    sessionId = await capture(reopened);
     await reopened.getByRole('button', { name: /Chrome 登录会话验证/ }).click();
     await reopened.getByRole('button', { name: /已登录用户发送消息/ }).click();
     await reopened.getByLabel('浏览器会话', { exact: true }).selectOption('bridge');
+    await reopened.getByLabel('单例运行标签页', { exact: true }).selectOption(sessionId);
     await target.bringToFront();
     await reopened.getByRole('button', { name: '连接 Chrome', exact: true }).click();
     await attach();
@@ -196,7 +230,7 @@ test('Chrome manual login stays outside recording; official Bridge records and r
     // The same condition-wait node also uses actual Bridge screenshots and AI transport.
     let saved = await reopened.evaluate(refs => window.workspace.workflow(refs), refs);
     await reopened.evaluate(async ({ refs, saved }) => window.workspace.saveWorkflow({ ...refs, revision: saved.revision, text: 'cases:\n  - name: Bridge wait\n    steps:\n      - aiWaitFor: {prompt: The page is ready, timeoutMs: 10000, checkIntervalMs: 200}\n      - assertText: {text: 已登录}\n' }), { refs, saved });
-    const waiting = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), refs);
+    const waiting = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), { ...refs, sessionId });
     await attach();
     await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === waiting)?.status, { timeout: 15000 }).toBe('passed');
     assert.equal(waitCalls, 2);
@@ -204,9 +238,9 @@ test('Chrome manual login stays outside recording; official Bridge records and r
     holdWait = true;
     saved = await reopened.evaluate(refs => window.workspace.workflow(refs), refs);
     await reopened.evaluate(async ({ refs, saved }) => window.workspace.saveWorkflow({ ...refs, revision: saved.revision, text: 'cases:\n  - name: Wait\n    steps:\n      - requireViewport: {width: 1100, height: 750}\n      - aiWaitFor:\n          prompt: waiting forever\n          timeoutMs: 30000\n' }), { refs, saved });
-    const cancelling = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), refs);
+    const cancelling = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), { ...refs, sessionId });
     await attach();
-    await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === cancelling)?.events.some(e => e.type === 'step-started' && e.node === 'aiWaitFor')).toBeTruthy();
+    await expect.poll(async () => (await reopened.evaluate(runId => window.workspace.runDetail({ runId }), cancelling)).events.some(e => e.type === 'step-started' && e.node === 'aiWaitFor')).toBeTruthy();
     await expect.poll(() => waitCalls).toBe(3);
     await reopened.evaluate(() => window.workspace.cancelRun());
     await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === cancelling)?.status).toBe('cancelled');
@@ -217,7 +251,7 @@ test('Chrome manual login stays outside recording; official Bridge records and r
     await cdp.detach();
     // Closing the recorded tab must fail, never silently operate another tab.
     await target.close();
-    const runId = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), refs);
+    const runId = await reopened.evaluate(refs => window.workspace.run({ ...refs, browserMode: 'bridge' }), { ...refs, sessionId });
     await attach();
     await expect.poll(async () => (await reopened.evaluate(() => window.workspace.state())).runs.find(r => r.runId === runId)?.status, { timeout: 45_000 }).toBe('error');
     assert.deepEqual(submitted, ['Bridge hello', 'Bridge hello']);

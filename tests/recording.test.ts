@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { expect } from '@playwright/test';
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright';
 
-const fixture = `<!doctype html><html><head><meta charset="utf-8"><title>Recorder verification</title><style>body{background:#f6f8fc;color:#183052;font:18px system-ui;margin:0}h1{position:absolute;left:64px;top:25px;font-size:25px}input{box-sizing:border-box;position:absolute;left:64px;top:110px;width:320px;height:44px;padding:10px;border:1px solid #ccd7e7;border-radius:8px;font-size:16px}button{position:absolute;left:404px;top:110px;width:120px;height:44px;background:#3479f4;color:white;border:0;border-radius:8px;font-size:16px}#result{position:absolute;left:64px;top:185px;color:#25815c}input[type=range]{appearance:none;margin:0;padding:0;border:0;background:transparent}input[type=range]::-webkit-slider-runnable-track{height:8px;background:#ccd7e7;border-radius:4px}input[type=range]::-webkit-slider-thumb{appearance:none;width:32px;height:32px;margin-top:-12px;border-radius:50%;background:#3479f4}footer{position:absolute;left:64px;top:700px;color:#8596ab;font-size:14px}</style></head><body><h1>Testing Workspace · 录制演示</h1><input aria-label="消息" placeholder="输入测试消息"><button>发送</button><div id="result">等待发送消息</div><input type="range" min="0" max="100" value="0" style="top:270px" oninput="if(this.value>60)document.getElementById('drag-result').textContent='滑动完成'"><div id="drag-result" style="position:absolute;left:64px;top:330px"></div><footer>本地测试页面 · 不调用外部服务</footer><script>document.querySelector('button').onclick=async()=>{const message=document.querySelector('input').value;await fetch('/submit',{method:'POST',body:message});document.querySelector('#result').textContent='发送成功：'+message;setTimeout(()=>history.pushState({},'', '/conversation/recorded'),1200);};</script></body></html>`;
+const fixture = `<!doctype html><html><head><meta charset="utf-8"><title>Recorder verification</title><style>body{background:#f6f8fc;color:#183052;font:18px system-ui;margin:0}h1{position:absolute;left:64px;top:25px;font-size:25px}input{box-sizing:border-box;position:absolute;left:64px;top:110px;width:320px;height:44px;padding:10px;border:1px solid #ccd7e7;border-radius:8px;font-size:16px}button{position:absolute;left:404px;top:110px;width:120px;height:44px;background:#3479f4;color:white;border:0;border-radius:8px;font-size:16px}#result{position:absolute;left:64px;top:185px;color:#25815c}input[type=range]{appearance:none;margin:0;padding:0;border:0;background:transparent}input[type=range]::-webkit-slider-runnable-track{height:8px;background:#ccd7e7;border-radius:4px}input[type=range]::-webkit-slider-thumb{appearance:none;width:32px;height:32px;margin-top:-12px;border-radius:50%;background:#3479f4}footer{position:absolute;left:64px;top:700px;color:#8596ab;font-size:14px}</style></head><body><h1>Testo · 录制演示</h1><input aria-label="消息" placeholder="输入测试消息"><button>发送</button><div id="result">等待发送消息</div><input type="range" min="0" max="100" value="0" style="top:270px" oninput="if(this.value>60)document.getElementById('drag-result').textContent='滑动完成'"><div id="drag-result" style="position:absolute;left:64px;top:330px"></div><footer>本地测试页面 · 不调用外部服务</footer><script>document.querySelector('button').onclick=async()=>{const message=document.querySelector('input').value;await fetch('/submit',{method:'POST',body:message});document.querySelector('#result').textContent='发送成功：'+message;setTimeout(()=>history.pushState({},'', '/conversation/recorded'),1200);};</script></body></html>`;
 
 const official = (page: Page) => page.frameLocator('iframe[title="Midscene 官方录制预览"]');
 async function clickPreview(page: Page, x: number, y: number) {
@@ -225,6 +225,8 @@ test('missed click evidence and unexecuted actions stay visible after restarting
   try {
     app = await electron.launch({ args: [process.cwd()], env });
     let ui = await app.firstWindow();
+    ui.on('pageerror', error => console.error('Missed-click renderer error:', error.message));
+    await ui.getByRole('button', { name: '新建项目', exact: true }).waitFor();
     await ui.evaluate(async (baseUrl) => {
       const projectId = await window.workspace.createProject({ name: '点击证据验证', description: '' });
       let project = (await window.workspace.state()).projects.find(p => p.id === projectId)!;
@@ -248,7 +250,9 @@ test('missed click evidence and unexecuted actions stay visible after restarting
     await expect(unexecuted.getByRole('button', { name: '执行后截图' })).toHaveCount(0);
     assert.equal(submissions, 0);
     await ui.screenshot({ path: path.join(data, 'missed-click.png'), fullPage: true });
-    const run = (await ui.evaluate(() => window.workspace.state())).runs[0]!;
+    const summary = (await ui.evaluate(() => window.workspace.state())).runs[0]!;
+    assert.deepEqual(summary.events, [], 'the history list returns summaries without screenshot events');
+    const run = await ui.evaluate(runId => window.workspace.runDetail({ runId }), summary.runId);
     const evidence = run.events.find(e => e.type === 'step-evidence' && e.stage === 'before');
     assert.ok(evidence?.type === 'step-evidence' && evidence.image);
     const shot = { runId: run.runId, image: evidence.image };

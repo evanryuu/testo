@@ -2,13 +2,15 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import express from 'express';
 import { chromium, type Browser, type BrowserServer, type Page, type Frame } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { playgroundForSessionManager, createMjpegPreviewDescriptor, describeRecorderUIEvent, type LaunchPlaygroundResult } from '@midscene/playground';
+import { playgroundForSessionManager, createMjpegPreviewDescriptor, type LaunchPlaygroundResult } from '@midscene/playground';
 import { findAvailablePort } from '@midscene/shared/node';
-import type { RecordingRequest, RecordingResponse, RecordedEvent } from '../shared/recording.js';
+import type { RecordingRequest, RecordingResponse, RecordedEvent, RecordedTarget } from '../shared/recording.js';
 import { createChromeBridge, connectChrome, bridgeValue, pinChromeViewport, type ChromeTarget } from './chrome-bridge.js';
-import { describeRecordedTarget } from './describe.js';
+import { inspectRecordedTarget } from '../shared/recorded-target.js';
+import { describeInWorker } from './description-worker.js';
 import { RecorderEvents } from './events.js';
 import { waitForStableViewport } from './viewport.js';
 
@@ -50,20 +52,14 @@ const collector = new RecorderEvents({
     await writeFile(assetFile(event), Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
     assets.add(asset.id);
   },
-  async describe(event) {
-    let config;
-    try { config = agent!.modelConfigManager.getModelConfig('default'); }
+  async describe(event, signal) {
+    try { agent!.modelConfigManager.getModelConfig('default'); }
     catch { return { ...event, semantic: { source: 'aiDescribe', status: 'failed', error: '请在 Model Settings 配置模型后开始录制；原始操作和截图已保留' } }; }
     const screenshot = event.screenshotAsset
       ? `data:${event.screenshotAsset.mimeType};base64,${(await readFile(assetFile(event))).toString('base64')}`
       : event.screenshotWithBox || event.screenshotBefore || event.screenshotAfter;
     if (!screenshot) throw new Error('录制截图不可用');
-    if (event.type !== 'scroll' && Number.isFinite(event.elementRect?.x) && Number.isFinite(event.elementRect?.y)) {
-      return describeRecordedTarget(agent!, event, screenshot);
-    }
-    const result = await describeRecorderUIEvent({ event: { ...event, screenshotBefore: screenshot }, target: { platformId: 'web', values: {} } }, config, { maxRetries: 1 });
-    if (result.usedFallback) throw new Error('描述生成失败');
-    return { ...event, semantic: { ...result.event.semantic!, confidence: 'low', error: '描述待确认：此操作没有可校验的单一目标，请检查描述后使用' }, elementDescription: undefined };
+    return describeInWorker(event, screenshot, signal);
   },
   changed(events) { emit({ type: 'events', events }); },
   idle() { if (reviewing) void cleanup().finally(() => { if (process.connected) process.disconnect(); }); },
@@ -71,7 +67,12 @@ const collector = new RecorderEvents({
 async function events(): Promise<RecordedEvent[]> {
   if (!refreshing) refreshing = (async () => {
     const result = await request('/recorder/events?since=0&flushPending=false');
-    await collector.update(result.events);
+    await collector.update(result.events.map((event: RecordedEvent) => {
+      const payload = event.rawPayload;
+      if (!payload || !('__testoTarget' in payload)) return event;
+      const { __testoTarget, ...rawPayload } = payload;
+      return { ...event, rawPayload, ...(__testoTarget ? { target: __testoTarget as RecordedTarget } : {}) };
+    }));
     return collector.values;
   })().finally(() => { refreshing = undefined; });
   return refreshing;
@@ -102,8 +103,12 @@ async function execute(message: RecordingRequest): Promise<unknown> {
     baseUrl = message.input.baseUrl;
     bridge = message.input.browserMode === 'bridge';
     if (bridge) {
-      agent = createChromeBridge();
-      chromeTarget = await connectChrome(agent, new URL(baseUrl).origin);
+      const selected = message.input.chromeTarget as ChromeTarget | undefined;
+      agent = createChromeBridge(undefined, selected?.profile?.port);
+      chromeTarget = await connectChrome(agent, new URL(baseUrl).origin, selected);
+      // Session validation attaches the debugger. Release it while the user
+      // prepares the page; begin/confirm reattach through the official API.
+      await agent.interface.detachDebugger(Number(chromeTarget.tabId));
       return { events: [], chromeTarget };
     }
     browserServer = await chromium.launchServer({ host: '127.0.0.1', channel: 'chrome', headless: true, timeout: 20_000 });
@@ -133,7 +138,7 @@ async function execute(message: RecordingRequest): Promise<unknown> {
       port: await findAvailablePort(20000 + Math.floor(Math.random() * 20000), 100), openBrowser: false, verbose: false,
       staticPath: fileURLToPath(new URL('../../../dist-preview', import.meta.url)),
       configureServer(server) {
-        server.setPreparedPlatform({ platformId: 'web', title: 'Testing Workspace', preview: createMjpegPreviewDescriptor(), sessionManager: {
+        server.setPreparedPlatform({ platformId: 'web', title: 'Testo', preview: createMjpegPreviewDescriptor(), sessionManager: {
           async createSession() { return {
             agent, platformId: 'web', preview: createMjpegPreviewDescriptor(),
             subscribeNavigationEvents(listener) {
@@ -156,6 +161,23 @@ async function execute(message: RecordingRequest): Promise<unknown> {
         server.app.use((req: { get(name: string): string | undefined; path: string }, res: { sendStatus(code: number): void }, next: () => void) => {
           if (req.get('X-Workspace-Recorder-Token') !== token) { res.sendStatus(403); return; }
           if (!/^\/(?:$|assets\/[^/]+$|session$|interact$|screenshot$|mjpeg$|status$|runtime-info$|interface-info$|recorder\/(?:start|stop|events|describe-event|assets\/[a-zA-Z0-9_-]+)$)/.test(req.path)) { res.sendStatus(404); return; }
+          next();
+        });
+        server.app.use('/interact', express.json({ limit: '1mb' }));
+        server.app.use(async (req: { method: string; path: string; body?: Record<string, any> }, _res: unknown, next: () => void) => {
+          if (req.method !== 'POST' || req.path !== '/interact' || !req.body) { next(); return; }
+          // The official recorder retains rawPayload, so attach the pre-action
+          // target here and promote it to event.target when collecting events.
+          // Never inspect the page after dispatch, when navigation may have changed it.
+          delete req.body.__testoTarget;
+          const { actionType, x, y } = req.body;
+          const point = Number.isFinite(x) && Number.isFinite(y) ? { x, y } : undefined;
+          if (point || ['Input', 'KeyboardPress'].includes(actionType)) {
+            try {
+              const expression = `(${inspectRecordedTarget.toString()})(${JSON.stringify(point ?? {})})`;
+              req.body.__testoTarget = bridge ? await bridgeValue((agent as ReturnType<typeof createChromeBridge>).interface, expression) : await page!.evaluate(expression);
+            } catch { /* Raw input remains recordable when the page has no readable DOM. */ }
+          }
           next();
         });
       },

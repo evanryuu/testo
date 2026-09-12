@@ -1,4 +1,5 @@
 export interface RunStepInfo {
+  metric?: 'first-response' | 'response-complete';
   node: string; phase: string; index: number; title: string; detail?: string;
   point?: { x: number; y: number }; viewport?: { width: number; height: number };
 }
@@ -19,6 +20,7 @@ export function describeRunStep(node: string, input: any, phase: string, index: 
   else if (node === 'aiAct') { step.title = 'AI 操作'; step.detail = typeof input === 'string' ? input : input?.prompt; }
   else if (node === 'aiAssert' || node === 'assertText') { step.title = '检查预期结果'; step.detail = typeof input === 'string' ? input : input?.prompt ?? input?.assertion ?? input?.text; }
   else if (node === 'aiWaitFor') { step.title = '等待预期状态'; step.detail = typeof input === 'string' ? input : `${input?.prompt ?? input?.assertion ?? ''}（最多等待 ${(input?.timeoutMs ?? 60000) / 1000} 秒）`; }
+  else if (node === 'waitForElement') { step.title = '等待页面元素'; step.detail = `${input?.selector ?? ''} · ${input?.state ?? 'visible'}（最多等待 ${(input?.timeoutMs ?? 30000) / 1000} 秒）`; }
   else if (node === 'recordToReport') step.title = '保存运行报告';
   return step;
 }
@@ -27,7 +29,7 @@ export function runPlanFromYaml(document: any): RunStepInfo[] {
   for (const [phase, entries] of Object.entries({ beforeAll: document?.beforeAll, beforeEach: document?.beforeEach, steps: document?.cases?.[0]?.steps, afterEach: document?.afterEach, afterAll: document?.afterAll })) {
     if (!Array.isArray(entries)) continue;
     entries.forEach((entry, index) => {
-      const node = entry && typeof entry === 'object' ? Object.keys(entry).find(key => key !== '$') : undefined;
+      const node = entry && typeof entry === 'object' ? Object.keys(entry).find(key => key !== '$' && key !== 'testo') : undefined;
       if (node) steps.push(describeRunStep(node, entry[node], phase, index));
     });
   }

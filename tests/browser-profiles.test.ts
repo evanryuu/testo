@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from 'node:net';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { RecordingService } from '../src/main/recording.js';
 import { io } from 'socket.io-client';
-import { BrowserProfileService } from '../src/main/browser-profiles.js';
+import { BrowserProfileService, type StoredProfile } from '../src/main/browser-profiles.js';
 import { captureChromeSession, connectChrome, createChromeBridge, readChromeProfileCatalog, type ChromeTarget } from '../src/recording/chrome-bridge.js';
 import type { ChromeProfileCatalog, ChromeProfileInfo } from '../src/shared/browser.js';
 
@@ -141,6 +145,7 @@ test('worker refresh pins profile identity and releases the port between operati
     await assertPortReleased(pairing.port);
     current = catalog(pairing.token, 'profile-B');
     await assert.rejects(service.focus(info.id, '42'), /不同的 Chrome/);
+    await assert.rejects(service.refresh(info.id), /不同的 Chrome/);
     assert.deepEqual(selected, [42], 'same tab ID in another profile must not receive focus');
     assert.equal(service.list()[0]!.profileInstallationId, 'profile-A');
     await assertPortReleased(pairing.port);
@@ -170,4 +175,75 @@ test('worker refresh pins profile identity and releases the port between operati
     await assertPortReleased(pairing.port);
     service.remove(info.id); assert.deepEqual(service.list(), []);
   } finally { socket.removeAllListeners(); socket.disconnect(); await service.destroy(); }
+});
+
+
+test('trusted pairings survive service restart without restoring stale tabs or readiness', async () => {
+  let saved: StoredProfile[] = [{ id: 'persisted-profile', name: 'Work Chrome', port: 13788, token: 'paired-token-0123456789', profileInstallationId: 'profile-A' }];
+  const persistence = { load: () => structuredClone(saved), save: (entries: StoredProfile[]) => { saved = structuredClone(entries); } };
+  const first = new BrowserProfileService(() => {}, persistence);
+  assert.equal(first.list()[0]!.profileInstallationId, 'profile-A');
+  assert.equal(first.list()[0]!.status, 'unconnected');
+  assert.deepEqual(first.list()[0]!.tabs, []);
+  const created = await first.create();
+  assert.equal(saved.length, 2);
+  assert.ok(saved.every(entry => !('tabs' in entry) && !('status' in entry) && !('sessionToken' in entry)));
+  await first.destroy();
+  const second = new BrowserProfileService(() => {}, persistence);
+  assert.deepEqual(second.list().map(info => info.id), ['persisted-profile', created.id]);
+  assert.ok(second.list().every(info => info.status === 'unconnected' && info.tabs.length === 0));
+  assert.equal(paired(second.list()[1]!).token, paired(created).token);
+  second.remove(created.id); assert.equal(saved.length, 1);
+  await second.destroy();
+});
+
+test('invalid or duplicate stored identities cannot silently open a connector', () => {
+  const valid = { id: 'p', name: 'Chrome', port: 13788, token: 'paired-token-0123456789' };
+  for (const profiles of [[{ ...valid, port: 0 }], [valid, valid], [{ ...valid, token: 'bad' }], [valid, { ...valid, id: 'other' }]]) {
+    assert.throws(() => new BrowserProfileService(() => {}, { load: () => profiles, save() {} }), /配对信息无效/);
+  }
+});
+
+
+test('recording and retry reconnect the selected profile/tab even when another tab is active', { timeout: 25000 }, async () => {
+  const profiles = new BrowserProfileService();
+  const info = await profiles.create(), pairing = paired(info);
+  const selected: unknown[] = [];
+  let unexpectedActiveConnection = false;
+  const socket = io(`http://127.0.0.1:${pairing.port}`, { transports: ['websocket'], query: { version: '1.12.4' }, reconnectionDelay: 50, reconnectionDelayMax: 100 });
+  socket.on('bridge-call', (call: { id: string; method: string; args: unknown[] }) => {
+    let response: unknown;
+    if (call.method === 'getBrowserTabList') response = { ...catalog(pairing.token), tabs: [...catalog(pairing.token).tabs, { tabId: '99', windowId: 5, index: 1, title: 'Same website, different tab', url: origin + '/other', active: true }] };
+    else if (call.method === 'setActiveTabId') selected.push(call.args[0]);
+    else if (call.method === 'url') response = origin + '/target';
+    else if (call.method === 'getActiveTabId') response = 42;
+    else if (call.method === 'connectCurrentTab') unexpectedActiveConnection = true;
+    socket.emit('bridge-call-response', { id: call.id, response });
+  });
+  socket.on('disconnect', () => { if (socket.active === false) socket.connect(); });
+  const recording = new RecordingService(mkdtempSync(path.join(tmpdir(), 'selected-recording-')), () => {});
+  const target = { tabId: '42', origin, profile: { connectorId: info.id, port: pairing.port, connectionToken: pairing.token, profileInstallationId: 'profile-A' } };
+  try {
+    const id = await recording.start({ projectId: 'p', caseId: 'c', workflowId: 'w', caseName: 'Same website tab', environmentId: 'local', baseUrl: origin, browserMode: 'bridge', chromeTarget: target, revision: 'r' });
+    assert.equal(recording.draft!.status, 'ready');
+    assert.deepEqual(recording.draft!.chromeTarget, target);
+    await recording.retry(id);
+    assert.deepEqual(selected.map(String), ['42', '42']);
+    assert.equal(unexpectedActiveConnection, false);
+    assert.deepEqual(recording.draft!.chromeTarget, target);
+  } finally {
+    await recording.shutdown(); socket.removeAllListeners(); socket.disconnect(); await profiles.destroy();
+  }
+});
+
+
+test('profile connection errors name the selected connector and redact pairing tokens', async () => {
+  const { agent } = fakeAgent();
+  agent.getBrowserTabList = async () => { throw new Error('Transport rejected paired-token'); };
+  await assert.rejects(connectChrome(agent, origin, target()), error => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /Testo/);
+    assert.doesNotMatch(error.message, /paired-token|Midscene 扩展/);
+    return true;
+  });
 });

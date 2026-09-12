@@ -1,3 +1,4 @@
+import { inspectRecordedTarget, targetMismatch } from '../shared/recorded-target.js';
 import { waitForStableViewport, type ViewportSize } from '../recording/viewport.js';
 import { bridgeValue } from '../recording/chrome-bridge.js';
 import { defineNode, type NodeExecutionContext } from '@midscene/test';
@@ -59,6 +60,13 @@ export function createRecordedNodes(options: {
         if (beforeClick.width !== expected.width || beforeClick.height !== expected.height) throw new Error(`操作前视口发生变化：预期 ${expected.width} × ${expected.height}，实际 ${beforeClick.width} × ${beforeClick.height}；未执行操作`);
         ctx.signal.throwIfAborted();
         try {
+          if (ctx.input.target) {
+            const point = { x: ctx.input.payload.x, y: ctx.input.payload.y };
+            const actual = options.getPage ? await options.getPage().evaluate(inspectRecordedTarget, point) : await bridgeValue((agent as AgentOverChromeBridge).interface, `(${inspectRecordedTarget.toString()})(${JSON.stringify(point)})`);
+            const mismatch = targetMismatch(ctx.input.target, actual);
+            if (mismatch) throw new Error(mismatch);
+          }
+          ctx.signal.throwIfAborted();
           await action.call(recordedActionParameters(ctx.input));
         } catch (error) {
           await options.onAction?.(ctx, agent, 'failed');

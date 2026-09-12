@@ -15,6 +15,7 @@ const interactionSchema = z.discriminatedUnion('actionType', [
 ]);
 
 type Update = { events: RecordingDraft['events']; frame?: RecordingFrame; chromeTarget?: RecordingDraft['chromeTarget']; viewport?: RecordingDraft['viewport']; startUrl?: string; preview?: { url: string; token: string } };
+export interface RecordingPersistence { encode(text: string): string; decode(text: string): string }
 export class RecordingService {
   draft?: RecordingDraft;
   private child?: ChildProcess;
@@ -29,11 +30,12 @@ export class RecordingService {
   private frameFile: string;
   private polling?: Promise<RecordingFrame>;
   private retrying = false;
-  constructor(private dataDir: string, private changed: () => void) {
+  constructor(private dataDir: string, private changed: () => void, private persistence?: RecordingPersistence) {
     this.file = path.join(dataDir, 'recording-draft.json');
     this.frameFile = path.join(dataDir, 'recording-preview.json');
     if (existsSync(this.file)) {
-      this.draft = JSON.parse(readFileSync(this.file, 'utf8')) ?? undefined;
+      const text = readFileSync(this.file, 'utf8');
+      this.draft = JSON.parse(this.persistence?.decode(text) ?? text) ?? undefined;
       if (this.draft?.status === 'ready' || this.draft?.status === 'recording' || this.draft?.status === 'starting') {
         this.draft.status = 'interrupted'; this.draft.error = '上次录制已中断，已采集的步骤仍可检查和保存。'; this.persist();
       }
@@ -51,14 +53,18 @@ export class RecordingService {
     }
     if (changed) this.persist();
   }
+  private encode(value: unknown): string {
+    const text = JSON.stringify(value);
+    return this.persistence?.encode(text) ?? text;
+  }
   private persist() {
     const temporary = `${this.file}.tmp`;
-    writeFileSync(temporary, JSON.stringify(this.draft ?? null), { mode: 0o600 });
+    writeFileSync(temporary, this.encode(this.draft ?? null), { mode: 0o600 });
     renameSync(temporary, this.file);
     if (this.draft) {
       const archive = path.join(this.dataDir, 'recordings', this.draft.id, 'draft.json');
       mkdirSync(path.dirname(archive), { recursive: true, mode: 0o700 });
-      writeFileSync(`${archive}.tmp`, JSON.stringify(this.draft), { mode: 0o600 });
+      writeFileSync(`${archive}.tmp`, this.encode(this.draft), { mode: 0o600 });
       renameSync(`${archive}.tmp`, archive);
     }
   }
@@ -120,7 +126,8 @@ export class RecordingService {
       if (draft.events.length) throw new Error('已经采集录制事件，请先检查并保存，或放弃当前草稿后重新录制');
       this.lastFrame = undefined; this.preview = undefined; this.polling = undefined;
       writeFileSync(this.frameFile, 'null', { mode: 0o600 });
-      draft.chromeTarget = undefined; draft.startUrl = undefined; draft.viewport = undefined;
+      // A retry reconnects the exact selected profile/tab; it must never fall back to whichever tab is active.
+      draft.startUrl = undefined; draft.viewport = undefined;
       draft.status = 'starting'; draft.error = undefined; this.persist(); this.changed();
       return await this.launchWorker(environment);
     } catch (error) {
@@ -169,7 +176,7 @@ export class RecordingService {
     });
     try {
       await ready;
-      this.accept(await this.rpc('start', { id: draft.id, baseUrl: draft.baseUrl, browserMode: draft.browserMode }));
+      this.accept(await this.rpc('start', { id: draft.id, baseUrl: draft.baseUrl, browserMode: draft.browserMode, chromeTarget: draft.chromeTarget }));
       draft.status = draft.browserMode === 'bridge' ? 'ready' : 'recording'; this.persist(); this.changed();
       return draft.id;
     } catch (error) {
@@ -257,7 +264,7 @@ export class RecordingService {
     // Keep the local snapshot as a recoverable discarded draft, but remove it from the active slot.
     const archive = path.join(this.dataDir, 'recordings', id, 'discarded.json');
     mkdirSync(path.dirname(archive), { recursive: true });
-    writeFileSync(archive, JSON.stringify(this.draft), { mode: 0o600 });
+    writeFileSync(archive, this.encode(this.draft), { mode: 0o600 });
     this.draft = undefined; this.lastFrame = undefined; this.persist(); this.changed();
   }
   async shutdown() {

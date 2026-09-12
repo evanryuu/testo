@@ -5,6 +5,9 @@ import { findAvailablePort } from '@midscene/shared/node';
 import type { ChromeProfileBinding, ChromeProfileCatalog, ChromeProfileInfo, ChromeTabInfo } from '../shared/browser.js';
 import { captureChromeSession, createChromeBridge, readChromeProfileCatalog, type ChromeTarget } from '../recording/chrome-bridge.js';
 
+export interface StoredProfile { id: string; name: string; port: number; token: string; profileInstallationId?: string }
+export interface ProfilePersistence { load(): StoredProfile[]; save(entries: StoredProfile[]): void }
+
 type ProfileEntry = { info: ChromeProfileInfo; port: number; connectionToken: string };
 type ProfileCommand = { action: 'refresh' | 'focus' | 'capture'; port: number; connectorId: string; connectionToken: string; profileInstallationId?: string; tabId?: string; origin?: string };
 type ProfileResult = { catalog: ChromeProfileCatalog; target?: ChromeTarget };
@@ -16,7 +19,21 @@ export class BrowserProfileService {
   private creating = false;
   private closed = false;
   private pending?: { child: ChildProcess; result: Promise<ProfileResult>; cancel: () => void };
-  constructor(private changed: () => void = () => {}) {}
+  constructor(private changed: () => void = () => {}, private persistence?: ProfilePersistence) {
+    const profiles = persistence?.load() ?? [];
+    const ports = new Set<number>();
+    for (const profile of profiles) {
+      if (!profile.id || !profile.name || !Number.isInteger(profile.port) || profile.port < 1024 || profile.port > 65535 || !/^[A-Za-z0-9_-]{16,256}$/.test(profile.token) || this.profiles.has(profile.id) || ports.has(profile.port)) throw new Error('保存的 Chrome 配对信息无效，请检查本机配置');
+      ports.add(profile.port);
+      this.profiles.set(profile.id, { port: profile.port, connectionToken: profile.token, info: {
+        id: profile.id, name: profile.name, profileInstallationId: profile.profileInstallationId,
+        pairingCode: `testo://connect?port=${profile.port}&token=${profile.token}`, status: 'unconnected', tabs: [],
+      } });
+    }
+  }
+  private persist(): void {
+    this.persistence?.save([...this.profiles.values()].map(({ info, port, connectionToken }) => ({ id: info.id, name: info.name, port, token: connectionToken, ...(info.profileInstallationId ? { profileInstallationId: info.profileInstallationId } : {}) })));
+  }
   get busy(): boolean { return this.creating || !!this.pending; }
   list(): ChromeProfileInfo[] { return [...this.profiles.values()].map(entry => structuredClone(entry.info)); }
 
@@ -29,12 +46,16 @@ export class BrowserProfileService {
       if (this.closed) throw new Error('浏览器配置服务已关闭');
       const id = randomUUID(), connectionToken = randomBytes(32).toString('hex');
       const info: ChromeProfileInfo = { id, name: `Chrome 配置 ${this.profiles.size + 1}`, status: 'unconnected', pairingCode: `testo://connect?port=${port}&token=${connectionToken}`, tabs: [] };
-      this.profiles.set(id, { info, port, connectionToken }); this.changed();
+      this.profiles.set(id, { info, port, connectionToken });
+      try { this.persist(); } catch (error) { this.profiles.delete(id); throw error; }
+      this.changed();
       return structuredClone(info);
     } finally { this.creating = false; }
   }
   remove(id: string): void {
-    this.available(); this.require(id); this.profiles.delete(id); this.changed();
+    this.available(); const entry = this.require(id); this.profiles.delete(id);
+    try { this.persist(); } catch (error) { this.profiles.set(id, entry); throw error; }
+    this.changed();
   }
   async refresh(id: string): Promise<ChromeProfileInfo> {
     await this.perform(id, 'refresh');
@@ -92,6 +113,7 @@ export class BrowserProfileService {
     try {
       const value = await result;
       entry.info = { ...entry.info, name: value.catalog.name, profileInstallationId: value.catalog.profileInstallationId, tabs: value.catalog.tabs, status: 'ready', checkedAt: new Date().toISOString(), error: undefined };
+      this.persist();
       return value;
     } catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).replaceAll(entry.connectionToken, '[已隐藏]');

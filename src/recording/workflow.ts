@@ -1,11 +1,12 @@
 import { isRecordingDescriptionVerified, type RecordedEvent } from '../shared/recording.js';
-import { stringify } from 'yaml';
+import { stringify, parseDocument, isSeq } from 'yaml';
 import { z } from 'zod/v4';
 
 export const RECORDING_VIEWPORT = { width: 1280, height: 800 } as const;
 
 export interface RecorderEvent {
   semantic?: RecordedEvent['semantic'];
+  target?: { tag?: string; role?: string; name?: string; testId?: string };
   hashId: string;
   actionType?: string;
   type?: string;
@@ -31,6 +32,7 @@ const point = { x: z.number().finite().min(0).max(16383).optional(), y: z.number
 export const recordedActionSchema = z.object({
   actionType: z.enum(['Tap', 'Input', 'KeyboardPress', 'Scroll', 'DragAndDrop']),
   viewport: z.object({ width: z.number().int().positive().max(16384), height: z.number().int().positive().max(16384) }).strict().optional(),
+  target: z.object({ tag: z.string().min(1).optional(), role: z.string().min(1).optional(), name: z.string().min(1).optional(), testId: z.string().min(1).optional() }).strict().optional(),
   payload: z.object({
     ...point,
     endX: z.number().finite().min(0).max(16383).optional(),
@@ -65,6 +67,7 @@ export function buildRecordedWorkflow(input: {
   steps?: RecordingReviewStep[];
   viewport?: { width: number; height: number };
   startUrl?: string;
+  baseUrl?: string;
 }): string {
   if (!input.name.trim()) throw new Error('用例名称不能为空');
   const choices = new Map((input.choices ?? []).map((choice) => [choice.hashId, choice]));
@@ -118,18 +121,44 @@ export function buildRecordedWorkflow(input: {
     } else if (actionType === 'Navigate') {
       const url = payload.url;
       if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) throw new Error('录制导航缺少有效的 HTTP 地址');
-      steps.push({ gotoUrl: { url } });
+      steps.push({ gotoUrl: { url: recordingNavigationUrl(url, input.baseUrl) } });
     } else {
       if (event.pageInfo.width !== viewport.width || event.pageInfo.height !== viewport.height) throw new Error('坐标回放步骤的视口发生变化，请保持 Chrome 窗口尺寸后重新录制');
       // The official recorder already coalesces typeOnly input. Preserve its value and mode exactly.
       const { actionType: _actionType, ...parameters } = payload;
-      const action = recordedActionSchema.parse({ actionType, payload: parameters, ...(input.viewport ? { viewport } : {}) });
+      const action = recordedActionSchema.parse({ actionType, payload: parameters, ...(event.target ? { target: event.target } : {}), ...(input.viewport ? { viewport } : {}) });
       steps.push({ recordedAction: action });
     }
   }
   if (!replayActions) throw new Error('请至少录制一个操作');
   const needsViewport = steps.some(step => 'recordedAction' in step);
-  steps.unshift({ gotoUrl: { url: input.startUrl ?? '${baseUrl}' } });
+  steps.unshift({ gotoUrl: { url: recordingNavigationUrl(input.startUrl, input.baseUrl) } });
   if (needsViewport) steps.unshift(input.viewport ? { requireViewport: viewport } : { setViewportSize: viewport });
   return stringify({ cases: [{ name: input.name.trim(), steps }], afterEach: [{ recordToReport: '录制回放结束时的页面' }] });
+}
+
+// Only URLs produced by a new recording are parameterized; saved YAML is never migrated implicitly.
+export function recordingNavigationUrl(url?: string, baseUrl?: string): string {
+  if (!url) return '${baseUrl}';
+  if (!baseUrl) return url;
+  const target = new URL(url), base = new URL(baseUrl);
+  if (target.origin !== base.origin) return url;
+  if (target.href === base.href || (target.pathname.replace(/\/$/, '') === base.pathname.replace(/\/$/, '') && target.search === base.search && target.hash === base.hash)) return '${baseUrl}';
+  return '${baseOrigin}' + target.pathname + target.search + target.hash;
+}
+
+/** Splice only recorded actions into the original YAML AST; preserve hooks, settings and comments. */
+export function mergeRecordedWorkflow(originalText: string, recordedText: string, start: number, deleteCount: number): string {
+  const original = parseDocument(originalText, { uniqueKeys: true }), recorded = parseDocument(recordedText, { uniqueKeys: true });
+  if (original.errors.length || recorded.errors.length) throw new Error('局部录制的 YAML 无法读取');
+  const steps = original.getIn(['cases', 0, 'steps']), incoming = recorded.getIn(['cases', 0, 'steps']);
+  if (!isSeq(steps) || !isSeq(incoming)) throw new Error('局部录制需要有效的步骤列表');
+  if (!Number.isInteger(start) || !Number.isInteger(deleteCount) || start < 0 || deleteCount < 0 || start + deleteCount > steps.items.length) throw new Error('局部录制位置无效');
+  // buildRecordedWorkflow always prepends optional viewport setup and one initial navigation.
+  let prefix = 0;
+  if (recorded.hasIn(['cases', 0, 'steps', 0, 'requireViewport']) || recorded.hasIn(['cases', 0, 'steps', 0, 'setViewportSize'])) prefix++;
+  if (!recorded.hasIn(['cases', 0, 'steps', prefix, 'gotoUrl'])) throw new Error('录制缺少初始导航');
+  prefix++;
+  steps.items.splice(start, deleteCount, ...incoming.items.slice(prefix));
+  return original.toString();
 }

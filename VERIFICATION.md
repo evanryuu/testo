@@ -223,3 +223,47 @@
 - 原有官方录制回放、桌面项目/用例/报告/历史、新 Profile 的真实 IPC 创建与解除、1000+ 分组和 React Flow 交互均通过。
 
 未安装扩展到日常 Chrome，也未运行真实 Longbridge 账号业务。只展示已配对 Profile，名称由用户设置。目录是检查时快照，应用重启后需要重新配对。首次使用需在目标 Profile 加载 dist-browser-extension/。
+
+## 2026-09-12 Workflow 编辑、参数与批次执行
+
+本轮将共享编译、项目资源、运行配置、历史详情和可视化编辑接入同一执行流程。实际验证均使用隔离项目与数据目录，没有改动日常项目、Chrome Profile 或真实业务账号。
+
+已验证：
+
+- 真实 Electron：Workflow 可视化编辑与 YAML 切换、变量/数据集、运行覆盖参数、异步等待、指定步骤调试、执行证据、取消及重启恢复；项目资源版本冲突时保留输入并要求重新加载。证据 `artifacts/desktop-EaACOE`、`artifacts/desktop-run.png`。
+- 真实 Testo Connector + Electron + Runner：9 次批次执行覆盖创建/删除共享同一中文名称、运行参数覆盖数据集默认值、排队期间修改原 YAML 和共享步骤不影响快照、失败/未完成重跑、关联场景整体重跑、重跑参数统一覆盖、原历史不变以及同源其他标签页未被操作。证据 `artifacts/batch-snapshots-g59gic`。
+- 原有批量入口：8 次真实运行覆盖跨窗口绑定、失败后停止/继续、取消、重启后历史恢复。证据 `artifacts/batch-integration-W0L6zU`。
+- 批量 UI：变量名校验、数据集、登录条件、时限及关联场景配置，证据 `artifacts/batch-ui-8gdPC7`。登录条件配置与传递已验证；此项批量测试未调用真实 AI 登录判断。
+- CLI：项目/分组/标签筛选、全部数据集、共享输入、队列冻结、失败策略、SIGINT 取消、JUnit、`--help`，经过真实子进程和本地 Chrome 执行。
+- ZIP 报告：解压后浏览器打开 index 链接和原生 Midscene 报告，选择 Screenshot 步骤，画面显示输入及提交结果 `release-123`。证据 `artifacts/execution-features-yDEaaG/portable-report.png` 已视觉确认。配置保留生效变量，原始快照单独保存；路径穿越、符号链接和凭证文件排除有回归测试。
+- Profile 配对恢复、精确标签页绑定、输入目标在导航前采集、描述生成取消、同源请求授权，以及坐标目标保护有真实服务/子进程回归。
+- 分页历史验证 160 条记录：列表不返回完整事件/配置快照，详情保留全部事件，老用例的最近状态不会因不在最近 50 条内丢失。
+
+安装包验证：
+
+- `ALLOW_HEAVY=1 npm run package:mac` 构建 Apple Silicon DMG 与 ZIP；构建中包含主进程/Renderer/预览 TypeScript 检查、Vite 和扩展构建。
+- `tests/package.test.ts` 实际启动打包后的 Testo.app，经真实 IPC 创建项目与用例、运行本地页面、导出 ZIP、录制 Tap、检查草稿加密、重启恢复项目/历史/草稿。证据 `artifacts/package-Ndm6ft/packaged-app.png` 已视觉确认。
+- `codesign --verify --deep --strict` 验证测试包完整性；此包是 ad-hoc 签名，不是 Developer ID 签名或 Apple 公证包。
+- Connector ZIP 中的 9 个文件与真实 Chrome 回归使用的 `dist-browser-extension` 逐字节一致。后台已打包为 IIFE，不需要将 manifest 改为 module。
+- 正式发布缺少证书时构建被阻止；测试版更新入口禁用。尚未验证正式证书、公证服务、GitHub 更新下载和升级安装，也未验证 Intel/Windows/Linux 安装包。
+
+限制：AI 等待的引擎回归使用本地模型 HTTP stub，验证截图、请求解析、串行检查和取消，没有消耗用户模型凭证。真实 Longbridge 页面上的模型识别质量仍需具体用例验证。Bridge 目前没有网络/控制台事件订阅，运行中明确报告此能力不可用。报告和截图没有自动内容脱敏，也不能保证复制报告包即可独立重放所有外部文件引用。
+
+运行前模型校验另有 3 项新增回归：普通文本 `aiAgent` 不触发模型要求；真实 AI 节点在启动单例/批次前检查默认模型名称；普通 DOM 用例可无模型运行。校验读取 Midscene 标准化节点，批次使用冻结配置。相关 project-features + cli-project 共 13 项通过。
+
+最终安装包复验通过（16.2 秒）：`artifacts/package-final-test.log`、`artifacts/package-KosdPE/packaged-app.png`。构建日志保存在 `artifacts/package-final-build.log`；DMG、应用 ZIP 和 Connector ZIP 均位于 `release/`，尚未发布 GitHub Release。
+
+录制准备态新增回归先在修复前失败：选中已确认标签页时，会话校验通过 CDP 附加调试器，成功准备后没有释放。`worker.ts` 在返回 ready 前调用官方公开 `detachDebugger`，保留 Bridge 通讯和原标签页。测试使用扩展原生只读命令区分扩展连接与 Playwright 自身连接，基线和 capture 后均无附加，修复前 ready 后仍附加；失败证据 `artifacts/chrome-bridge-HwQtz7`。
+
+上述准备态修复后，完整官方 Chrome Bridge 2/2 通过（28.7 秒），`artifacts/chrome-bridge-B4qNUB/prepare-debugger-state.json` 确认扩展未持有 debugger；后续录制/回放、视口恢复、条件等待取消和关闭目标保护均通过。适配新版选择器与历史详情接口后的五份旧集成测试累计 15/15 通过，原交互断言保留。
+
+包含准备态修复的安装包在全新隔离进程中复验通过（11.8 秒），证据 `artifacts/package-13V6vc/packaged-app.png`、`artifacts/package-recheck-test.log`。一次旧测试进程曾返回系统加密服务不可用，测试清理随后未退出；已在测试中增加明确的加密可用性检查与 5 秒退出上限。未修改产品加密方式或系统钥匙串，重新启动后的真实加密、录制、执行、ZIP 导出及重启恢复均通过。最终主进程/界面/预览类型检查和 diff 检查通过。
+
+
+## 2026-09-12 Testo 品牌与旧版数据兼容
+
+应用侧栏、窗口和网页标题、原生菜单、About、录制预览、README 与启动入口统一为 Testo。保留 npm 包名和 Electron 内部存储身份，避免更改旧安装版默认目录及 macOS Keychain 密钥名称；启动文件改为 `启动 Testo.command`。
+
+- 最终 Apple Silicon 安装包真实集成测试 1/1 通过（33.5 秒），验证 Testo 标题/侧栏/菜单、创建项目与用例、执行、录制、ZIP 导出、草稿加密和重启恢复。证据 `artifacts/testo-brand-package-test.log`、`artifacts/package-k140UB/packaged-app.png`，已目视确认。
+- 旧安装包在隔离目录生成合成密文，新安装包沿用该目录并成功解密；数据目录、内部名称及包名保持兼容。证据 `artifacts/brand-compat-c3D28p/before.json`、`after.json` 和 `testo-packaged-window.png`。未读取个人凭证。
+- 桌面完整构建、最终主进程编译、安装包构建、`codesign --verify --deep --strict` 及 diff 检查通过。安装包仍为 ad-hoc 签名，没有进行 Apple 公证或创建 GitHub Release。

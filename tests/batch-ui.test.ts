@@ -34,6 +34,9 @@ test('batch UI selects explicit Chrome profile tabs, retries pairing, preserves 
         if (method === 'state') return { ok: true, value: fixture };
         calls.push({ method, input });
         let value: unknown;
+        if (method === 'workflow') return { ok: true, value: { revision: 'workflow-1', text: 'testo:\n  datasets:\n    - id: smoke\n      name: 冒烟数据\n      variables: { knowledgeBaseName: default }\ncases:\n  - name: Fixture\n    steps: []\n' } };
+        if (method === 'runDetail') return { ok: true, value: fixture.runs.find((run: any) => run.runId === input.runId) };
+        if (method === 'history') return { ok: true, value: { runs: fixture.runs, total: fixture.runs.length } };
         if (method === 'browserProfiles') return { ok: true, value: profiles };
         if (method === 'addBrowserProfile') { value = { id: 'profile-new', name: 'Profile C', status: 'unconnected', pairingCode: 'pair-c', tabs: [] }; profiles.push(value); }
         else if (method === 'copyBrowserPairingCode' || method === 'openBrowserConnector' || method === 'focusBrowserTab') value = undefined;
@@ -115,14 +118,23 @@ test('batch UI selects explicit Chrome profile tabs, retries pairing, preserves 
     await page.getByRole('button', { name: '上移用例 批次检查', exact: true }).click();
     await expect(page.getByTestId('batch-case-row').first()).toHaveAttribute('data-case-id', 'check');
     await page.getByLabel('批量失败处理').selectOption('continue');
+    await page.getByRole('region', { name: '批次共享变量', exact: true }).getByRole('button', { name: '添加变量' }).click();
+    await page.getByLabel('批次共享变量名称 1', { exact: true }).fill('bad name');
+    await expect(page.getByRole('button', { name: '开始批量运行', exact: true })).toBeDisabled();
+    await page.getByLabel('批次共享变量名称 1', { exact: true }).fill('knowledgeBaseName');
+    await page.getByLabel('批次共享变量值 1', { exact: true }).fill('UI shared knowledge base');
+    await page.getByLabel('用例有前后依赖，重跑时必须从第一条开始', { exact: true }).check();
+    await page.getByLabel('批次登录检查', { exact: true }).fill('用户已经登录');
+    await page.getByLabel('批次用例时限', { exact: true }).fill('45');
+    await page.getByLabel('数据集 批次检查', { exact: true }).selectOption('smoke');
     await page.screenshot({ path: path.join(data, 'batch-config.png'), fullPage: true });
     await page.getByRole('button', { name: '开始批量运行', exact: true }).click();
     await expect(page.getByTestId('batch-results')).toBeVisible();
     await expect(page.getByTestId('batch-result-item').first()).toContainText('运行中');
     await expect(page.getByTestId('batch-result-item').nth(1)).toContainText('排队中');
     const calls: any[] = await app.evaluate(() => (globalThis as any).batchCalls);
-    assert.deepEqual(calls.find(call => call.method === 'runBatch').input, { projectId: 'p', environmentId: 'env', failurePolicy: 'continue', items: [
-      { caseId: 'check', workflowId: 'check-w', sessionId: 's1' }, { caseId: 'send', workflowId: 'send-w', sessionId: 's2' },
+    assert.deepEqual(calls.find(call => call.method === 'runBatch').input, { projectId: 'p', environmentId: 'env', failurePolicy: 'continue', variables: { knowledgeBaseName: 'UI shared knowledge base' }, loginCondition: '用户已经登录', dependent: true, timeoutMs: 45000, items: [
+      { caseId: 'check', workflowId: 'check-w', sessionId: 's1', datasetId: 'smoke' }, { caseId: 'send', workflowId: 'send-w', sessionId: 's2', datasetId: undefined },
     ] });
     assert.equal(calls.filter(call => call.method === 'captureSession').length, 0);
     assert.deepEqual(calls.filter(call => call.method === 'useBrowserTab').map(call => call.input), [

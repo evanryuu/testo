@@ -8,7 +8,7 @@ import stdlib from 'node-stdlib-browser';
 import { findAvailablePort } from '@midscene/shared/node';
 import { expect } from '@playwright/test';
 import { _electron as electron, chromium, type BrowserContext, type ElectronApplication, type Page } from 'playwright';
-import { stringify } from 'yaml';
+import { parse, stringify } from 'yaml';
 import type { BatchInput, BatchRun } from '../src/shared/workspace.js';
 
 test('desktop batches reuse confirmed Chrome sessions, isolate results, enforce failure policy and restore history', { timeout: 180_000 }, async () => {
@@ -164,8 +164,11 @@ window.startAutoBridge = (url) => {
         const state = await ui!.evaluate(() => window.workspace.state());
         const batch = state.batches!.find(b => b.id === id)!;
         if (state.activeRunId) connected.add(state.activeRunId);
-        if (cancel && !cancelled && state.runs.find(run => run.runId === state.activeRunId)?.events.some(event => event.type === 'step-started' && event.node === 'wait')) {
-          cancelled = true; await ui!.evaluate(id => window.workspace.cancelBatch({ id }), id);
+        if (cancel && !cancelled && state.activeRunId) {
+          const detail = await ui!.evaluate(runId => window.workspace.runDetail({ runId }), state.activeRunId);
+          if (detail.events.some(event => event.type === 'step-started' && event.node === 'wait')) {
+            cancelled = true; await ui!.evaluate(id => window.workspace.cancelBatch({ id }), id);
+          }
         }
         return batch.status;
       }, { timeout: 45_000, intervals: [100, 200, 300] }).not.toBe('running');
@@ -242,6 +245,213 @@ window.startAutoBridge = (url) => {
     assert.equal(automaticConnections, 10, 'two session confirmations and eight runs reconnect automatically without per-run test assistance');
     writeFileSync(path.join(dir, 'observations.json'), JSON.stringify({ automaticConnections, invalidGroups, restoredGroups: restored.projects.find(project => project.id === refs.projectId)!.groups, targets, hits, batches: completed, restoredSessionCount: restored.sessions!.length, restoredRuns: restored.runs.length }, null, 2));
     console.log('Batch integration evidence:', dir);
+  } catch (error) {
+    writeFileSync(path.join(dir, 'failure-hits.json'), JSON.stringify(hits, null, 2));
+    if (ui && !ui.isClosed()) {
+      writeFileSync(path.join(dir, 'failure-state.json'), JSON.stringify(await ui.evaluate(() => window.workspace.state()).catch(() => null), null, 2));
+      await ui.screenshot({ path: path.join(dir, 'failure.png') }).catch(() => {});
+    }
+    throw error;
+  } finally {
+    await app?.close(); await chrome?.close(); server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+
+test('desktop connector batches freeze shared inputs and workflows, and retry the intended failed or dependent items', { timeout: 240_000 }, async () => {
+  const root = process.cwd();
+  mkdirSync('artifacts', { recursive: true });
+  const dir = mkdtempSync(path.resolve('artifacts/batch-snapshots-'));
+  const extension = path.resolve('dist-browser-extension');
+  const hits: { action: string; name: string; who: string; accepted: boolean }[] = [];
+  let allowDelete = false;
+  const server = createServer((request, response) => {
+    const url = new URL(request.url!, 'http://local.test');
+    if (url.pathname === '/hit') {
+      const action = url.searchParams.get('action')!, name = url.searchParams.get('name')!;
+      const accepted = action !== 'delete' || allowDelete;
+      hits.push({ action, name, who: url.searchParams.get('who')!, accepted });
+      response.setHeader('Content-Type', 'application/json; charset=utf-8');
+      response.end(JSON.stringify({ text: accepted ? `${name} ${action} completed` : 'Delete rejected by fixture' }));
+      return;
+    }
+    response.setHeader('Content-Type', 'text/html; charset=utf-8');
+    response.end(`<!doctype html><title>Knowledge base fixture</title>
+      <input aria-label="Knowledge base name" style="position:absolute;left:20px;top:20px;width:350px;height:30px">
+      <button data-testid="create" style="position:absolute;left:20px;top:80px;width:100px;height:40px" onclick="send('create')">Create</button>
+      <button data-testid="delete" style="position:absolute;left:140px;top:80px;width:100px;height:40px" onclick="send('delete')">Delete</button>
+      <button data-testid="after" style="position:absolute;left:260px;top:80px;width:100px;height:40px" onclick="send('after')">After</button>
+      <p id="result" style="position:absolute;top:150px">Ready</p>
+      <script>async function send(action){const query=new URLSearchParams({action,name:document.querySelector('input').value,who:sessionStorage.getItem('who')||'unknown'});const result=await fetch('/hit?'+query,{method:'POST'}).then(r=>r.json());document.querySelector('#result').textContent=result.text}</script>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && entry[0] !== 'ELECTRON_RUN_AS_NODE' && !entry[0].startsWith('MIDSCENE_MODEL') && !entry[0].startsWith('OPENAI_'))),
+    WORKSPACE_DATA_DIR: path.join(dir, 'app'), WORKSPACE_PROJECTS_DIR: path.join(dir, 'projects') };
+  let app: ElectronApplication | undefined, chrome: BrowserContext | undefined, ui: Page | undefined;
+  const completed: BatchRun[] = [];
+  const flow = { name: 'Fill shared knowledge base name', steps: [{ recordedAction: {
+    actionType: 'Input', payload: { x: 70, y: 35, value: '${knowledgeBaseName}', mode: 'replace' },
+    target: { tag: 'input', name: 'Knowledge base name' },
+  } }] };
+  try {
+    chrome = await chromium.launchPersistentContext(path.join(dir, 'chrome'), {
+      channel: 'chromium', executablePath: process.env.TEST_CHROME_EXECUTABLE, headless: false, viewport: null,
+      args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
+    });
+    const worker = chrome.serviceWorkers()[0] ?? await chrome.waitForEvent('serviceworker');
+    const target = await chrome.newPage(); await target.goto(origin + '/target');
+    await target.evaluate(() => sessionStorage.setItem('who', 'chosen-tab'));
+    const other = await chrome.newPage(); await other.goto(origin + '/other');
+    await other.evaluate(() => sessionStorage.setItem('who', 'other-tab'));
+    app = await electron.launch({ args: [root], env, timeout: 45_000 });
+    ui = await app.firstWindow(); ui.setDefaultTimeout(15000);
+    const uiErrors: string[] = []; ui.on('pageerror', error => uiErrors.push(error.message));
+    const refs = await ui.evaluate(async ({ baseUrl, flow }) => {
+      const projectId = await window.workspace.createProject({ name: 'Batch snapshots', description: 'Real connector and runner checks' });
+      let project = (await window.workspace.state()).projects.find(project => project.id === projectId)!;
+      const environmentId = project.environments[0]!.id;
+      await window.workspace.saveEnvironment({ projectId, id: environmentId, name: 'Local', baseUrl, variables: { knowledgeBaseName: 'environment default' } });
+      await window.workspace.saveAssets({ projectId, revision: project.assets!.revision, variables: { knowledgeBaseName: 'project default' }, flows: { fillName: flow } });
+      const cases = [];
+      for (const name of ['Create knowledge base', 'Delete knowledge base', 'Continue after delete']) {
+        const caseId = await window.workspace.createCase({ projectId, name, suiteId: project.suites[0]!.id, platforms: ['web'] });
+        project = (await window.workspace.state()).projects.find(project => project.id === projectId)!;
+        cases.push({ caseId, workflowId: project.cases.find(item => item.id === caseId)!.workflows[0]!.id });
+      }
+      return { projectId, environmentId, cases };
+    }, { baseUrl: origin + '/target', flow });
+    const definitions = ['create', 'delete', 'after'].map((action, index) => stringify({
+      testo: { variables: { knowledgeBaseName: 'case default' }, datasets: [{ id: 'smoke', name: 'Smoke', variables: { knowledgeBaseName: 'dataset default' } }] },
+      cases: [{ name: action, steps: [
+        ...(index === 0 ? [{ wait: { duration: 1, unit: 's' } }] : []),
+        { gotoUrl: '${baseUrl}' },
+        { useFlow: { id: 'fillName' } },
+        { recordedAction: { actionType: 'Tap', payload: { x: 70 + index * 120, y: 100 }, target: { tag: 'button', testId: action } } },
+        { assertText: { text: '${knowledgeBaseName} ' + action + ' completed', timeoutMs: 1200 } },
+      ] }], afterEach: [{ recordToReport: 'Batch snapshot evidence' }],
+    }));
+    const saveDefinition = async (index: number, text: string) => ui!.evaluate(async ({ ref, text }) => {
+      const source = await window.workspace.workflow(ref);
+      await window.workspace.saveWorkflow({ ...ref, revision: source.revision, text });
+    }, { ref: { projectId: refs.projectId, ...refs.cases[index]! }, text });
+    for (let index = 0; index < definitions.length; index++) await saveDefinition(index, definitions[index]!);
+
+    // Pair the actual shipped extension and select a precise tab through the public desktop API.
+    const profile = await ui.evaluate(() => window.workspace.addBrowserProfile());
+    const settings = await chrome.newPage();
+    await settings.goto(`chrome-extension://${new URL(worker.url()).host}/options.html`);
+    await settings.getByLabel('连接名称').fill('Batch integration profile');
+    await settings.getByLabel('Testo 连接代码').fill(profile.pairingCode);
+    await settings.getByRole('button', { name: '保存并连接' }).click();
+    const catalog = await ui.evaluate(id => window.workspace.refreshBrowserProfile({ id }), profile.id);
+    assert.equal(catalog.status, 'ready');
+    const selected = catalog.tabs.find(tab => tab.url === origin + '/target')!;
+    assert.ok(selected); assert.equal(catalog.tabs.length, 2);
+    await settings.close(); await other.bringToFront();
+    const sessionId = await ui.evaluate(input => window.workspace.useBrowserTab(input), {
+      projectId: refs.projectId, environmentId: refs.environmentId, profileId: profile.id, tabId: selected.tabId,
+    });
+    const input = {
+      projectId: refs.projectId, environmentId: refs.environmentId, failurePolicy: 'stop',
+      variables: { knowledgeBaseName: 'Shared release 知识库' }, timeoutMs: 30000,
+      items: refs.cases.map(item => ({ ...item, sessionId, datasetId: 'smoke' })),
+    } satisfies BatchInput;
+    const waitForBatch = async (id: string) => {
+      await expect.poll(async () => (await ui!.evaluate(() => window.workspace.state())).batches!.find(batch => batch.id === id)?.status,
+        { timeout: 65000, intervals: [150, 300, 500] }).not.toBe('running');
+      const state = await ui!.evaluate(() => window.workspace.state());
+      const batch = state.batches!.find(batch => batch.id === id)!;
+      assert.ok(batch.finishedAt); assert.equal(state.activeBatchId, undefined);
+      completed.push(batch); return batch;
+    };
+    const verifySnapshots = async (batch: BatchRun, expectedName: string) => {
+      assert.deepEqual(batch.snapshot!.variables, { knowledgeBaseName: expectedName });
+      assert.deepEqual(batch.snapshot!.flows!.fillName, flow, 'batch uses the shared flow captured before starting');
+      for (const item of batch.items) {
+        const index = refs.cases.findIndex(ref => ref.caseId === item.caseId);
+        assert.equal(item.datasetId, 'smoke');
+        assert.equal(item.definition, definitions[index], 'batch stores the original editable YAML');
+        if (!item.runId) continue;
+        const detail = await ui!.evaluate(runId => window.workspace.runDetail({ runId }), item.runId);
+        assert.ok(detail.events.some(event => event.type === 'step-started'), 'full history exposes real runner steps');
+        assert.deepEqual(detail.snapshot, batch.snapshot);
+        assert.equal(detail.result!.definitionHash, item.definitionHash);
+        const artifact = detail.result!.artifactDirectory;
+        assert.equal(readFileSync(path.join(artifact, 'workflow.yaml'), 'utf8'), definitions[index]);
+        const configuration = JSON.parse(readFileSync(path.join(artifact, 'run-configuration.json'), 'utf8'));
+        assert.equal(configuration.variables.knowledgeBaseName, expectedName);
+        assert.equal(configuration.datasetId, 'smoke');
+        const compiled = readFileSync(path.join(artifact, 'compiled-workflow.yaml'), 'utf8');
+        const compiledSteps = parse(compiled).cases[0].steps;
+        assert.ok(compiledSteps.some((step: any) => step.recordedAction?.actionType === 'Input' && step.recordedAction.payload.value === '${knowledgeBaseName}'));
+        assert.ok(!compiledSteps.some((step: any) => step.useFlow), 'shared flows are expanded before execution');
+        assert.ok(!compiled.includes('poison'), 'queued runs and retries ignore later source edits');
+      }
+    };
+
+    const firstId = await ui.evaluate(input => window.workspace.runBatch(input), input);
+    // Change both the queued case and its shared flow after the batch accepted the definitions.
+    await saveDefinition(1, stringify({ cases: [{ name: 'poison edit', steps: [{ assertText: 'poison should not run' }] }] }));
+    await ui.evaluate(async projectId => {
+      const project = (await window.workspace.state()).projects.find(item => item.id === projectId)!;
+      await window.workspace.saveAssets({ projectId, revision: project.assets!.revision, variables: { knowledgeBaseName: 'poison project default' },
+        flows: { fillName: { name: 'poison flow edit', steps: [{ assertText: 'poison should not run' }] } } });
+    }, refs.projectId);
+    const firstBatch = await waitForBatch(firstId);
+    assert.deepEqual(firstBatch.items.map(item => item.status), ['passed', 'failed', 'skipped'], JSON.stringify(firstBatch));
+    assert.deepEqual(hits.map(hit => [hit.action, hit.name, hit.who]), [
+      ['create', input.variables!.knowledgeBaseName, 'chosen-tab'], ['delete', input.variables!.knowledgeBaseName, 'chosen-tab'],
+    ], 'create and delete receive exactly the same batch override in the chosen tab');
+    await verifySnapshots(firstBatch, String(input.variables!.knowledgeBaseName));
+
+    allowDelete = true;
+    const failedRetry = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'failed' as const, sessionId }));
+    assert.equal(failedRetry.status, 'passed', JSON.stringify(failedRetry));
+    assert.equal(failedRetry.sourceBatchId, firstId); assert.equal(failedRetry.retryMode, 'failed');
+    assert.deepEqual(failedRetry.items.map(item => item.caseId), [refs.cases[1]!.caseId]);
+    assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'delete']);
+    await verifySnapshots(failedRetry, String(input.variables!.knowledgeBaseName));
+    const unfinishedRetry = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'unfinished' as const, sessionId }));
+    assert.equal(unfinishedRetry.status, 'passed', JSON.stringify(unfinishedRetry));
+    assert.deepEqual(unfinishedRetry.items.map(item => item.caseId), [refs.cases[2]!.caseId]);
+    assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'delete', 'after']);
+    await verifySnapshots(unfinishedRetry, String(input.variables!.knowledgeBaseName));
+
+    // A dependent scenario restarts from its first case, even when the user chooses failed only.
+    await saveDefinition(1, definitions[1]!);
+    await ui.evaluate(async ({ projectId, flow }) => {
+      const project = (await window.workspace.state()).projects.find(item => item.id === projectId)!;
+      await window.workspace.saveAssets({ projectId, revision: project.assets!.revision, variables: { knowledgeBaseName: 'project default' }, flows: { fillName: flow } });
+    }, { projectId: refs.projectId, flow });
+    allowDelete = false;
+    const dependent = await waitForBatch(await ui.evaluate(input => window.workspace.runBatch(input), { ...input, dependent: true }));
+    assert.deepEqual(dependent.items.map(item => item.status), ['passed', 'failed', 'skipped']);
+    allowDelete = true;
+    const retryName = 'Retry shared 知识库';
+    const restarted = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), {
+      id: dependent.id, mode: 'failed' as const, sessionId, variables: { knowledgeBaseName: retryName },
+    }));
+    assert.equal(restarted.status, 'passed', JSON.stringify(restarted));
+    assert.equal(restarted.dependent, true); assert.equal(restarted.sourceBatchId, dependent.id);
+    assert.deepEqual(restarted.items.map(item => item.caseId), refs.cases.map(item => item.caseId));
+    assert.deepEqual(hits.slice(-3).map(hit => [hit.action, hit.name]), [['create', retryName], ['delete', retryName], ['after', retryName]]);
+    await verifySnapshots(restarted, retryName);
+    const finalState = await ui.evaluate(() => window.workspace.state());
+    assert.deepEqual(finalState.batches!.find(batch => batch.id === firstId), firstBatch, 'retries leave the original batch unchanged');
+    assert.deepEqual(finalState.batches!.find(batch => batch.id === dependent.id), dependent);
+    assert.equal(hits.length, 9); assert.ok(hits.every(hit => hit.who === 'chosen-tab'));
+    assert.equal(await other.locator('#result').textContent(), 'Ready', 'another page with the same origin receives no action');
+    const history = await ui.evaluate(projectId => window.workspace.history({ projectId, offset: 0, limit: 2 }), refs.projectId);
+    assert.equal(history.total, 9); assert.equal(history.runs.length, 2);
+    assert.ok(history.runs.every(run => run.events.length === 0), 'history lists stay light; full events are fetched on demand');
+    assert.deepEqual(uiErrors, []);
+    await target.screenshot({ path: path.join(dir, 'chosen-tab-result.png') });
+    writeFileSync(path.join(dir, 'observations.json'), JSON.stringify({ hits, batches: completed, totalRuns: history.total,
+      selectedTabId: selected.tabId, selectedProfile: catalog.name, otherTabUnchanged: true }, null, 2));
+    console.log('Batch snapshot integration evidence:', dir);
   } catch (error) {
     writeFileSync(path.join(dir, 'failure-hits.json'), JSON.stringify(hits, null, 2));
     if (ui && !ui.isClosed()) {

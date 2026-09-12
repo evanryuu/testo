@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parse, stringify } from 'yaml';
+import { validateVariables, compileWorkflow } from '../shared/workflow-document.js';
+import type { ProjectAssets } from '../shared/workspace.js';
 import type { Environment, Project, SaveGroupInput, Suite, TestCase, TestGroup, Workflow } from '../shared/workspace.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -113,7 +115,7 @@ export class WorkspaceStore {
         const e = readYaml(fileIn(root, `environments/${name}`));
         const id = required(e.id, 'Environment ID');
         if (environments.some((env) => env.id === id)) throw new Error('Environment ID 重复');
-        environments.push({ id, name: required(e.name, '环境名称'), web: { baseUrl: required(e.web?.baseUrl, '环境地址') } });
+        environments.push({ id, name: required(e.name, '环境名称'), web: { baseUrl: required(e.web?.baseUrl, '环境地址') }, variables: validateVariables(e.variables ?? {}) });
       } catch (error) { errors.push(`${name}: ${String(error)}`); }
     }
     const groups: TestGroup[] = [];
@@ -132,7 +134,7 @@ export class WorkspaceStore {
         } catch (error) { errors.push(`groups/${name}: ${String(error)}`); }
       }
     } catch (error) { errors.push(`groups: ${String(error)}`); }
-    const project: Project = { id: required(config.project?.id, 'Project ID'), name: required(config.project?.name, '项目名称'), description: config.project.description ?? '', root, suites, cases, environments, groups, errors };
+    const project: Project = { id: required(config.project?.id, 'Project ID'), name: required(config.project?.name, '项目名称'), description: config.project.description ?? '', root, suites, cases, environments, groups, errors, assets: this.readAssets(root) };
     this.workflowIndexes.set(project, workflowIndex);
     return project;
   }
@@ -227,7 +229,44 @@ export class WorkspaceStore {
     if (!data || !Array.isArray(data.cases) || data.cases.length !== 1 || !data.cases[0].name || !Array.isArray(data.cases[0].steps) || !data.cases[0].steps.length) throw new Error('YAML 必须包含一个具名 Case 和非空 steps；Markdown 无法直接执行');
     writeAtomic(file, input.text);
   }
-  saveEnvironment(input: { projectId: string; id?: string; name: string; baseUrl: string }): void {
+  private readAssets(root: string): ProjectAssets {
+    const file = fileIn(root, 'resources.yaml');
+    const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
+    const data = text ? readYaml(file) : { schemaVersion: 1, variables: {}, flows: {} };
+    if (data.schemaVersion !== 1) throw new Error('不支持的共享资源版本');
+    return { revision: hash(text), variables: validateVariables(data.variables ?? {}), flows: this.validateFlows(data.flows ?? {}) };
+  }
+  private validateFlows(value: unknown): ProjectAssets['flows'] {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('共享步骤格式错误');
+    const flows = value as ProjectAssets['flows'];
+    for (const [id, flow] of Object.entries(flows)) {
+      if (!/^[a-zA-Z0-9_-]{1,100}$/.test(id) || ['__proto__', 'constructor', 'prototype'].includes(id)) throw new Error('共享步骤 ID 格式错误');
+      required(flow?.name, '共享步骤名称');
+      if (!Array.isArray(flow.steps) || !flow.steps.length) throw new Error('共享步骤不能为空');
+      compileWorkflow(stringify({ cases: [{ name: flow.name, steps: [{ useFlow: { id } }] }] }), { flows });
+    }
+    return flows;
+  }
+  saveAssets(input: { projectId: string; revision: string; variables: ProjectAssets['variables']; flows: ProjectAssets['flows'] }): ProjectAssets {
+    const project = this.project(input.projectId);
+    const current = this.readAssets(project.root);
+    if (current.revision !== input.revision) throw new Error('共享资源已被外部修改，请刷新后保存');
+    const flows = this.validateFlows(input.flows);
+    const removed = Object.keys(current.flows).filter(id => !Object.hasOwn(flows, id));
+    if (removed.length) {
+      for (const item of project.cases) for (const workflow of item.workflows) {
+        if (!workflow.ready) continue;
+        const { file } = this.workflowLocationFromProject(project, item.id, workflow.id);
+        const document = readYaml(file);
+        const references = (value: unknown): boolean => !!value && typeof value === 'object' &&
+          (typeof (value as any).useFlow?.id === 'string' && removed.includes((value as any).useFlow.id) || Object.values(value).some(references));
+        if (references(document)) throw new Error(`${item.name} 仍在引用待删除的共享步骤，请先修改该用例`);
+      }
+    }
+    writeAtomic(fileIn(project.root, 'resources.yaml'), { schemaVersion: 1, variables: validateVariables(input.variables), flows });
+    return this.readAssets(project.root);
+  }
+  saveEnvironment(input: { projectId: string; id?: string; name: string; baseUrl: string; variables?: ProjectAssets['variables'] }): void {
     const p = this.project(input.projectId);
     if (!/^https?:$/.test(new URL(input.baseUrl).protocol)) throw new Error('环境地址必须使用 HTTP 或 HTTPS');
     const id = input.id ?? randomUUID();
@@ -235,9 +274,10 @@ export class WorkspaceStore {
     let file = fileIn(p.root, `environments/${id}.yaml`);
     if (input.id) {
       const dir = fileIn(p.root, 'environments');
-      const existing = readdirSync(dir).filter((name) => /\.ya?ml$/.test(name)).find((name) => readYaml(fileIn(p.root, `environments/${name}`)).id === id);
+      const existing = readdirSync(dir).filter((name) => /\.ya?ml$/.test(name)).find((name) => { try { return readYaml(fileIn(p.root, `environments/${name}`)).id === id; } catch { return false; } });
       if (existing) file = fileIn(p.root, `environments/${existing}`);
     }
-    writeAtomic(file, { id, name: required(input.name, '环境名称'), web: { baseUrl: input.baseUrl } });
+    const previous = existsSync(file) ? readYaml(file) : {};
+    writeAtomic(file, { ...previous, id, name: required(input.name, '环境名称'), web: { baseUrl: input.baseUrl }, variables: validateVariables(input.variables ?? previous.variables ?? {}) });
   }
 }

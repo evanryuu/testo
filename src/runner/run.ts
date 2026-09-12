@@ -1,4 +1,7 @@
 import { parse } from 'yaml';
+import { normalizeStep } from '@midscene/test';
+import { waitInputSchema as nativeWaitSchema } from '@midscene/test/midscene';
+import { compileWorkflow } from '../shared/workflow-document.js';
 import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -14,7 +17,7 @@ export interface RunHandle {
   cancel(): void;
 }
 
-// Add explicit condition-wait windows to the existing two-minute run allowance.
+// Reserve cleanup/startup time plus each native step deadline and explicit wait window.
 export function defaultRunTimeout(source: string): number {
   try {
     const document = parse(source);
@@ -24,17 +27,28 @@ export function defaultRunTimeout(source: string): number {
       ...(document?.afterEach ?? []), ...(document?.afterAll ?? []),
     ];
     return 120000 + entries.reduce((total: number, entry: any) => {
-      if (!entry || !Object.hasOwn(entry, 'aiWaitFor')) return total;
-      const value = entry.aiWaitFor?.timeoutMs ?? 60000;
-      return total + (Number.isInteger(value) && value >= 1000 && value <= 300000 ? value : 0);
+      if (!entry) return total;
+      const step = normalizeStep(entry);
+      if (step.meta.timeoutMs !== undefined) return total + step.meta.timeoutMs;
+      if (step.node === 'wait') {
+        const input = nativeWaitSchema.parse(step.input);
+        return total + input.duration * (input.unit === 'min' ? 60000 : input.unit === 's' ? 1000 : 1);
+      }
+      if (!['aiWaitFor', 'waitForElement'].includes(step.node)) return total + 30000;
+      const value = step.input.timeoutMs ?? (step.node === 'aiWaitFor' ? 60000 : 30000);
+      return total + (typeof value === 'number' && Number.isInteger(value) && value >= 1000 && value <= 300000 ? value : 0);
     }, 0);
   } catch { return 120000; } // The worker reports invalid YAML through normal run history.
 }
 
 export function startRun(options: RunOptions, onEvent: (event: WorkerEvent) => void = () => {}, environment: NodeJS.ProcessEnv = process.env): RunHandle {
+  options = structuredClone(options);
+  if (options.workflowText === undefined) {
+    try { options.workflowText = readFileSync(options.workflowPath, 'utf8'); } catch { /* Worker reports source errors in run history. */ }
+  }
   let timeoutMs = options.timeoutMs ?? 120_000;
   if (options.timeoutMs === undefined) {
-    try { timeoutMs = defaultRunTimeout(readFileSync(options.workflowPath, 'utf8')); } catch { /* The worker reports file read failures. */ }
+    try { timeoutMs = defaultRunTimeout(compileWorkflow(options.workflowText ?? readFileSync(options.workflowPath, 'utf8'), options).text); } catch { /* The worker reports file read failures. */ }
   }
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('timeoutMs must be positive');
   if (!/^https?:$/.test(new URL(options.baseUrl).protocol)) throw new Error('baseUrl must use HTTP or HTTPS');
@@ -117,7 +131,7 @@ export function startRun(options: RunOptions, onEvent: (event: WorkerEvent) => v
         runId, status, artifactDirectory,
         startedAt: new Date(started).toISOString(), finishedAt: new Date().toISOString(), durationMs: Date.now() - started,
         reportPaths: finished?.reportPaths ?? [], definitionHash: finished?.definitionHash,
-        runnerVersion: '1.12.4', ...(error ? { error } : {}),
+        runnerVersion: '1.12.4', checks: finished?.checks, ...(error ? { error } : {}),
       };
       writeFileSync(path.join(artifactDirectory, 'summary.json'), JSON.stringify(summary, null, 2), { mode: 0o600 });
       resolve(summary);

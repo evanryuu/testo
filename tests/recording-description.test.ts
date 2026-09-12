@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { chromium } from 'playwright';
 import { describeRecordedTarget } from '../src/recording/describe.js';
+import { describeInWorker } from '../src/recording/description-worker.js';
 import type { RecordedEvent } from '../src/shared/recording.js';
 import { RecordingService } from '../src/main/recording.js';
 
@@ -150,4 +151,42 @@ test('saved Retina screenshots verify the recorded point, retry wrong targets an
       assert.equal(locations, scenario === 'describe-error' ? 0 : 2);
     }
   } finally { await browser.close(); }
+});
+
+
+test('cancelling an official description terminates its process and closes the actual model request', { timeout: 20000 }, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  let received!: () => void, disconnected!: () => void;
+  const requestStarted = new Promise<void>(resolve => { received = resolve; });
+  const requestClosed = new Promise<void>(resolve => { disconnected = resolve; });
+  const server = createServer((request, response) => {
+    request.resume();
+    request.once('end', received);
+    response.once('close', disconnected);
+    // Deliberately never respond. Cancellation must close the socket, not just abandon a promise.
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const previous = { ...process.env };
+  const controller = new AbortController();
+  try {
+    for (const key of Object.keys(process.env)) if (key.startsWith('MIDSCENE_MODEL') || key.startsWith('OPENAI_')) delete process.env[key];
+    Object.assign(process.env, { MIDSCENE_MODEL_NAME: 'local-cancellation', MIDSCENE_MODEL_FAMILY: 'gpt-5', MIDSCENE_MODEL_BASE_URL: `http://127.0.0.1:${address.port}/v1`, MIDSCENE_MODEL_API_KEY: 'local-test-key' });
+    const page = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    await page.setContent('<button style="position:absolute;left:20px;top:20px;width:100px;height:40px">Send</button>');
+    const screenshot = 'data:image/png;base64,' + (await page.screenshot()).toString('base64');
+    const event: RecordedEvent = { hashId: 'cancel', type: 'click', actionType: 'Tap', timestamp: 1, pageInfo: { width: 400, height: 300 }, elementRect: { x: 50, y: 40 }, rawPayload: { actionType: 'Tap', x: 50, y: 40 } };
+    const operation = describeInWorker(event, screenshot, controller.signal);
+    const rejected = assert.rejects(operation, /用户取消/);
+    await requestStarted;
+    controller.abort(new Error('用户取消'));
+    await rejected;
+    await requestClosed;
+  } finally {
+    controller.abort();
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+    await browser.close(); server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });
