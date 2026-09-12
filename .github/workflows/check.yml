@@ -21,6 +21,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install chromium
       - run: npm run build:desktop
-      - run: node --test --test-concurrency=1 dist/tests/workspace.test.js dist/tests/workflow-document.test.js dist/tests/execution-features.test.js dist/tests/project-features.test.js dist/tests/cli-project.test.js dist/tests/report-bundle.test.js
+      - run: node --test --test-concurrency=1 dist/tests/workspace.test.js dist/tests/bulk-cases.test.js dist/tests/workflow-document.test.js dist/tests/execution-features.test.js dist/tests/project-features.test.js dist/tests/cli-project.test.js dist/tests/report-bundle.test.js
       - run: npm run test:desktop
       - run: node --test dist/tests/chrome-onboarding-ui.test.js
+      - run: node --test dist/tests/bulk-cases-ui.test.js

@@ -8,6 +8,10 @@ export interface Suite { id: string; name: string; directory: string }
 export interface TestGroup { id: string; name: string; description: string; caseIds: string[]; revision: string }
 export interface SaveGroupInput { projectId: string; id?: string; revision?: string; name: string; description: string; caseIds: string[] }
 export interface GroupBatchInput extends RunConfiguration { projectId: string; environmentId: string; failurePolicy: 'stop' | 'continue'; sessionId: string; groupIds: string[]; datasetIds?: Record<string, string> }
+export type BulkCaseOperation = { kind: 'delete' } | { kind: 'moveSuite'; suiteId: string }
+  | { kind: 'addGroup' | 'removeGroup'; groupId: string; revision: string };
+export interface BulkCaseInput { projectId: string; cases: { id: string; revision: string }[]; operation: BulkCaseOperation }
+export interface BulkCaseResult { count: number; warning?: string }
 export interface Environment { id: string; name: string; web: { baseUrl: string }; variables?: Variables }
 export interface Workflow { id: string; platform: 'web' | 'android' | 'ios'; definitionPath: string; ready: boolean }
 export interface TestCase {
@@ -60,6 +64,7 @@ export interface DesktopApi {
   state(): Promise<WorkspaceState>;
   createProject(input: { name: string; description: string }): Promise<string>;
   openProject(): Promise<string | null>;
+  bulkCases(input: BulkCaseInput): Promise<BulkCaseResult>;
   saveGroup(input: SaveGroupInput): Promise<string>;
   deleteGroup(input: { projectId: string; id: string; revision: string }): Promise<void>;
   runGroups(input: GroupBatchInput): Promise<string>;

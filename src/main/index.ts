@@ -257,6 +257,14 @@ const handlers: Record<string, (input: any) => unknown> = {
   createSuite: (i) => store.createSuite(i.projectId, i.name),
   createCase: (i) => store.createCase(i.projectId, i.name, i.suiteId, i.platforms),
   saveCase: (i) => store.saveCase(i),
+  bulkCases: (i) => {
+    if (occupied()) throw new Error('请等待当前运行或浏览器连接结束后再批量操作');
+    const draft = recorder.draft;
+    if (draft && draft.status !== 'saved' && draft.projectId === i.projectId && i.cases.some((item: { id: string }) => item.id === draft.caseId)) {
+      throw new Error('所选用例有未保存的录制，请先保存或放弃录制');
+    }
+    return store.bulkCases(i);
+  },
   workflow: (i) => store.workflow(i.projectId, i.caseId, i.workflowId),
   importFile: async () => {
     const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: [{ name: 'Midscene Workflow', extensions: ['yaml', 'yml'] }] });

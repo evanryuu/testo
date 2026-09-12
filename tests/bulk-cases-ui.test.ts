@@ -1,0 +1,116 @@
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { test } from 'node:test';
+import { expect } from '@playwright/test';
+import { _electron as electron, type ElectronApplication } from 'playwright';
+
+test('case multi-selection supports filtered actions, confirmation, real Suite/Group updates and deletion', { timeout: 60000 }, async () => {
+  mkdirSync('artifacts', { recursive: true });
+  const directory = mkdtempSync(path.resolve('artifacts/bulk-cases-ui-'));
+  let app: ElectronApplication | undefined;
+  try {
+    app = await electron.launch({ args: [process.cwd()], env: {
+      ...Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'ELECTRON_RUN_AS_NODE')),
+      WORKSPACE_DATA_DIR: path.join(directory, 'data'), WORKSPACE_PROJECTS_DIR: path.join(directory, 'projects'),
+    } });
+    const page = await app.firstWindow(), errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.getByRole('button', { name: '新建项目', exact: true }).waitFor();
+    await app.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows()[0]!.setSize(1100, 700); });
+    const fixture = await page.evaluate(async () => {
+      const projectId = await window.workspace.createProject({ name: 'Bulk UI', description: '' });
+      const original = (await window.workspace.state()).projects[0]!;
+      const target = await window.workspace.createSuite({ projectId, name: 'Knowledge' });
+      for (const name of ['Alpha create', 'Alpha delete', 'Beta other']) await window.workspace.createCase({ projectId, name, suiteId: original.suites[0]!.id, platforms: ['web'] });
+      const group = await window.workspace.saveGroup({ projectId, name: 'Smoke', description: '', caseIds: [] });
+      return { projectId, target, group, root: original.root };
+    });
+    await page.getByRole('button', { name: /Bulk UI/ }).click();
+    const checkbox = page.getByRole('checkbox', { name: '选择用例 Alpha create', exact: true });
+    await checkbox.check();
+    await expect(page.getByRole('heading', { name: /^Test Cases/ })).toBeVisible();
+    await expect(page.getByRole('checkbox', { name: '选择全部筛选结果', exact: true })).toHaveAttribute('data-state', 'indeterminate');
+    await page.getByLabel('搜索用例', { exact: true }).fill('Alpha');
+    await expect(checkbox).not.toBeChecked();
+    await page.getByRole('checkbox', { name: '选择全部筛选结果', exact: true }).check();
+    await expect(page.getByRole('status').filter({ hasText: '已选 2 个用例' })).toBeVisible();
+    await page.screenshot({ path: path.join(directory, 'selected.png'), animations: 'disabled' });
+    await page.getByRole('button', { name: '加入 Group', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('Alpha create'); await expect(dialog).not.toContainText('Beta other');
+    await expect(dialog.getByRole('button', { name: '确认操作', exact: true })).toBeDisabled();
+    await dialog.getByLabel('目标 Group', { exact: true }).selectOption(fixture.group);
+    await dialog.getByRole('button', { name: '确认操作', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    let project = await page.evaluate(async () => (await window.workspace.state()).projects[0]!);
+    assert.equal(project.groups![0]!.caseIds.length, 2);
+    await page.getByRole('checkbox', { name: '选择全部筛选结果', exact: true }).check();
+    await page.getByRole('button', { name: '从 Group 移除', exact: true }).click();
+    await dialog.getByLabel('目标 Group', { exact: true }).selectOption(fixture.group);
+    await dialog.getByRole('button', { name: '确认操作', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    project = await page.evaluate(async () => (await window.workspace.state()).projects[0]!);
+    assert.deepEqual(project.groups![0]!.caseIds, []); assert.equal(project.cases.length, 3);
+    await page.getByRole('checkbox', { name: '选择全部筛选结果', exact: true }).check();
+    await page.getByRole('button', { name: '移动到 Suite', exact: true }).click();
+    await dialog.getByLabel('目标 Suite', { exact: true }).selectOption(fixture.target);
+    await dialog.getByRole('button', { name: '确认操作', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    project = await page.evaluate(async () => (await window.workspace.state()).projects[0]!);
+    assert.equal(project.cases.filter(item => item.suiteId === fixture.target).length, 2);
+    await page.getByRole('checkbox', { name: '选择全部筛选结果', exact: true }).check();
+    await page.getByRole('button', { name: '删除所选', exact: true }).click();
+    await expect(dialog).toContainText('运行历史和报告保留');
+    await expect(dialog.getByRole('button', { name: '确认删除用例', exact: true })).toBeInViewport();
+    await page.screenshot({ path: path.join(directory, 'delete-confirmation.png'), animations: 'disabled' });
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    assert.equal((await page.evaluate(() => window.workspace.state())).projects[0]!.cases.length, 3);
+    // A concurrent file edit must remain visible as an error, without deleting any case.
+    await page.getByRole('button', { name: '删除所选', exact: true }).click();
+    const changed = project.cases.find(item => item.name === 'Alpha delete')!;
+    const file = path.join(fixture.root, project.suites.find(suite => suite.id === fixture.target)!.directory, changed.id, 'case.yaml');
+    writeFileSync(file, readFileSync(file, 'utf8').replace('Alpha delete', 'Alpha updated'));
+    await dialog.getByRole('button', { name: '确认删除用例', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('修改或删除');
+    assert.equal((await page.evaluate(() => window.workspace.state())).projects[0]!.cases.length, 3);
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    await page.getByRole('button', { name: '刷新', exact: true }).click();
+    await expect(page.getByRole('checkbox', { name: '选择用例 Alpha updated', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: '删除所选', exact: true }).click();
+    await dialog.getByRole('button', { name: '确认删除用例', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByTestId('case-list-row')).toHaveCount(0);
+    project = await page.evaluate(async () => (await window.workspace.state()).projects[0]!);
+    assert.deepEqual(project.cases.map(item => item.name), ['Beta other']);
+    await page.getByLabel('搜索用例', { exact: true }).fill('');
+    await page.getByRole('checkbox', { name: '选择用例 Beta other', exact: true }).check();
+    await page.getByRole('button', { name: '运行所选', exact: true }).click();
+    await expect(page.getByRole('heading', { name: '批量运行', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: /^Test Cases/ }).click();
+    await page.evaluate(async () => {
+      const project = (await window.workspace.state()).projects[0]!;
+      for (let index = 0; index < 30; index++) await window.workspace.createCase({ projectId: project.id, name: 'Long list ' + index, suiteId: project.suites[0]!.id, platforms: ['web'] });
+    });
+    await page.getByRole('button', { name: '刷新', exact: true }).click();
+    await expect(page.getByTestId('case-list-row')).toHaveCount(31);
+    await page.getByRole('checkbox', { name: '选择全部筛选结果', exact: true }).check();
+    await page.getByRole('button', { name: '删除所选', exact: true }).click();
+    await app.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]!; window.setMinimumSize(0, 0); window.setContentSize(800, 560); });
+    await expect.poll(() => page.evaluate(() => [innerWidth, innerHeight])).toEqual([800, 560]);
+    await dialog.evaluate(async element => { await Promise.all(element.getAnimations().map(animation => animation.finished)); });
+    const confirm = dialog.getByRole('button', { name: '确认删除用例', exact: true });
+    await expect(confirm).toBeInViewport();
+    const top = (await confirm.boundingBox())!.y;
+    const scroll = dialog.locator(':scope > div').nth(1);
+    await scroll.hover(); await page.mouse.wheel(0, 600);
+    await expect.poll(() => scroll.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    assert.ok(Math.abs((await confirm.boundingBox())!.y - top) < 2);
+    await expect(confirm).toBeInViewport();
+    await page.screenshot({ path: path.join(directory, 'long-confirmation-small.png'), animations: 'disabled' });
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    assert.equal((await page.evaluate(() => window.workspace.state())).projects[0]!.cases.length, 31);
+    assert.deepEqual(errors, []);
+    console.log('Bulk cases UI evidence:', directory);
+  } finally { await app?.close(); }
+});

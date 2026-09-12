@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parse, stringify } from 'yaml';
 import { validateVariables, compileWorkflow } from '../shared/workflow-document.js';
 import type { ProjectAssets } from '../shared/workspace.js';
-import type { Environment, Project, SaveGroupInput, Suite, TestCase, TestGroup, Workflow } from '../shared/workspace.js';
+import type { BulkCaseInput, BulkCaseResult, Environment, Project, SaveGroupInput, Suite, TestCase, TestGroup, Workflow } from '../shared/workspace.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const required = (value: unknown, label: string): string => {
@@ -37,6 +37,7 @@ function readYaml(file: string): any {
 
 export class WorkspaceStore {
   private roots: string[];
+  private caseIndexes = new WeakMap<Project, Map<string, string>>();
   private workflowIndexes = new WeakMap<Project, Map<string, { file: string; platform: string; caseFile: string; caseRevision: string }>>();
   constructor(private dataDir: string, private projectsDir: string) {
     mkdirSync(dataDir, { recursive: true });
@@ -83,6 +84,7 @@ export class WorkspaceStore {
     if (new Set(suites.map((s) => s.id)).size !== suites.length || new Set(suites.map((s) => s.directory)).size !== suites.length) throw new Error('Suite ID 或目录重复');
     const cases: TestCase[] = [], environments: Environment[] = [], errors: string[] = [];
     const caseIds = new Set<string>();
+    const caseIndex = new Map<string, string>();
     const workflowIndex = new Map<string, { file: string; platform: string; caseFile: string; caseRevision: string }>();
     for (const suite of suites) {
       const directory = fileIn(root, suite.directory);
@@ -105,6 +107,7 @@ export class WorkspaceStore {
           if (!Array.isArray(item.tags) || !item.tags.every((t: unknown) => typeof t === 'string')) throw new Error('Tags 格式错误');
           cases.push({ id, name: required(item.name, 'Case 名称'), description: item.description ?? '', suiteId: suite.id, priority: item.priority ?? 'P1', tags: item.tags, workflows, revision: hash(text) });
           caseIds.add(id);
+          caseIndex.set(id, caseFile);
           for (const workflow of workflows) workflowIndex.set(JSON.stringify([id, workflow.id]), { file: fileIn(root, path.join(suite.directory, entry.name, workflow.definitionPath)), platform: workflow.platform, caseFile, caseRevision: hash(text) });
         } catch (error) { errors.push(`${suite.name}/${entry.name}: ${String(error)}`); }
       }
@@ -136,6 +139,7 @@ export class WorkspaceStore {
     } catch (error) { errors.push(`groups: ${String(error)}`); }
     const project: Project = { id: required(config.project?.id, 'Project ID'), name: required(config.project?.name, '项目名称'), description: config.project.description ?? '', root, suites, cases, environments, groups, errors, assets: this.readAssets(root) };
     this.workflowIndexes.set(project, workflowIndex);
+    this.caseIndexes.set(project, caseIndex);
     return project;
   }
   private groupId(value: unknown): string {
@@ -210,6 +214,117 @@ export class WorkspaceStore {
     const data = readYaml(file);
     Object.assign(data, { name: required(input.name, '用例名称'), description: input.description, priority: input.priority, tags: input.tags });
     writeAtomic(file, data);
+  }
+  bulkCases(input: BulkCaseInput): BulkCaseResult {
+    const project = this.project(input.projectId), operation = input.operation;
+    if (!Array.isArray(input.cases) || !input.cases.length || input.cases.some(item => !item || typeof item.id !== 'string' || typeof item.revision !== 'string')) throw new Error('请选择有效的用例');
+    const ids = new Set(input.cases.map(item => item.id));
+    if (ids.size !== input.cases.length) throw new Error('所选用例不能重复');
+    if (!operation || !['delete', 'moveSuite', 'addGroup', 'removeGroup'].includes(operation.kind)) throw new Error('不支持的批量操作');
+    if (project.errors.length) throw new Error('项目文件存在错误，请先修复后再批量操作：' + project.errors[0]);
+    const available = new Map(project.cases.map(item => [item.id, item]));
+    const locations = this.caseIndexes.get(project)!;
+    const selected = input.cases.map(reference => {
+      const item = available.get(reference.id);
+      if (!item || item.revision !== reference.revision) throw new Error('所选用例已被修改或删除，请刷新列表后重新选择');
+      return { item, file: locations.get(item.id)! };
+    });
+    const writes: { file: string; before: string; after: string }[] = [];
+    const moves: { from: string; to: string }[] = [];
+    const within = (directory: string, file: string) => file === directory || file.startsWith(directory + path.sep);
+    if (operation.kind === 'addGroup' || operation.kind === 'removeGroup' || operation.kind === 'delete') {
+      const groups = operation.kind === 'delete' ? (project.groups ?? []).filter(group => group.caseIds.some(id => ids.has(id)))
+        : (project.groups ?? []).filter(group => group.id === operation.groupId);
+      if (operation.kind !== 'delete' && (!groups.length || groups[0]!.revision !== operation.revision)) throw new Error('目标 Group 已被修改或删除，请刷新后重新选择');
+      for (const group of groups) {
+        const file = fileIn(project.root, `groups/${group.id}.yaml`), before = readFileSync(file, 'utf8'), data = readYaml(file);
+        data.caseIds = operation.kind === 'addGroup' ? [...new Set([...group.caseIds, ...ids])] : group.caseIds.filter(id => !ids.has(id));
+        writes.push({ file, before, after: stringify(data) });
+      }
+    }
+    if (operation.kind === 'moveSuite' || operation.kind === 'delete') {
+      const target = operation.kind === 'moveSuite' ? project.suites.find(suite => suite.id === operation.suiteId) : undefined;
+      if (operation.kind === 'moveSuite' && !target) throw new Error('目标 Suite 不存在，请刷新后重新选择');
+      const affected = selected.filter(({ item }) => !target || item.suiteId !== target.id);
+      const directories = affected.map(({ file }) => path.dirname(file));
+      // A case directory is movable only when it owns its contents. Imported layouts
+      // can contain nested suites or workflows referenced by another case.
+      const checkTree = (directory: string): void => {
+        if (lstatSync(directory).isSymbolicLink() || realpathSync(directory) !== directory) throw new Error('用例目录包含符号链接，请先整理文件路径');
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+          if (entry.isSymbolicLink()) throw new Error('用例目录包含符号链接，请先整理文件路径');
+          if (entry.isDirectory()) checkTree(path.join(directory, entry.name));
+        }
+      };
+      const references = project.cases.filter(item => !ids.has(item.id)).map(item => {
+        const caseFile = locations.get(item.id)!;
+        const files = [caseFile, ...item.workflows.map(workflow => fileIn(project.root, path.resolve(path.dirname(caseFile), workflow.definitionPath)))];
+        return { name: item.name, files: files.flatMap(file => existsSync(file) ? [file, realpathSync(file)] : [file]) };
+      });
+      for (const directory of directories) {
+        checkTree(directory);
+        if (['workspace.yaml', 'resources.yaml', 'groups', 'environments'].some(relative => within(directory, fileIn(project.root, relative)))) throw new Error('用例目录包含项目配置，无法批量操作');
+        if (project.suites.some(suite => within(directory, fileIn(project.root, suite.directory)))) throw new Error('用例目录内包含 Suite，无法批量移动或删除');
+        if (directories.some(other => other !== directory && within(directory, other))) throw new Error('用例目录存在嵌套，无法批量操作');
+        const reference = references.find(reference => reference.files.some(file => within(directory, file)));
+        if (reference) throw new Error(`用例「${reference.name}」仍引用所选用例目录，请先解除共享文件引用`);
+      }
+      if (target) {
+        for (const { file } of affected) {
+          const from = path.dirname(file), to = fileIn(project.root, path.join(target.directory, path.basename(from)));
+          if (existsSync(to) || moves.some(move => move.to === to)) throw new Error('目标 Suite 存在同名用例目录，未移动任何用例');
+          moves.push({ from, to });
+        }
+        for (const { file } of selected) {
+          const before = readFileSync(file, 'utf8'), data = readYaml(file), move = moves.find(move => move.from === path.dirname(file));
+          let changed = !!move;
+          if (move) data.suiteId = target.id;
+          for (const workflow of data.workflows ?? []) {
+            const original = fileIn(project.root, path.resolve(path.dirname(file), workflow.definitionPath));
+            if (existsSync(original) && realpathSync(original) !== original && moves.some(candidate => within(candidate.from, realpathSync(original)))) throw new Error('Workflow 通过符号链接引用待移动目录，请先整理文件路径');
+            const owner = moves.find(candidate => within(candidate.from, original));
+            const destination = owner ? path.join(owner.to, path.relative(owner.from, original)) : original;
+            if (move || owner) {
+              workflow.definitionPath = path.relative(move?.to ?? path.dirname(file), destination).split(path.sep).join('/');
+              changed = true;
+            }
+          }
+          if (changed) writes.push({ file, before, after: stringify(data) });
+        }
+      } else {
+        for (const directory of directories) moves.push({ from: directory, to: '' });
+      }
+    }
+    // Validate the entire plan before touching any selected case. Roll back completed
+    // writes and renames on an I/O failure, rather than leaving a partial batch.
+    for (const { item, file } of selected) if (hash(readFileSync(fileIn(project.root, file), 'utf8')) !== item.revision) throw new Error('用例已被外部修改，请刷新后重试');
+    for (const write of writes) if (readFileSync(fileIn(project.root, write.file), 'utf8') !== write.before) throw new Error('项目文件已被外部修改，请刷新后重试');
+    const appliedWrites: typeof writes = [], appliedMoves: typeof moves = [];
+    let staging: string | undefined;
+    try {
+      if (operation.kind === 'delete') {
+        staging = mkdtempSync(path.join(project.root, '.testo-delete-'));
+        moves.forEach((move, index) => { move.to = path.join(staging!, String(index)); });
+      }
+      for (const write of writes) { writeAtomic(write.file, write.after); appliedWrites.push(write); }
+      for (const move of moves) {
+        fileIn(project.root, move.from); fileIn(project.root, move.to);
+        mkdirSync(path.dirname(move.to), { recursive: true });
+        renameSync(move.from, move.to); appliedMoves.push(move);
+      }
+    } catch (error) {
+      const rollbackErrors: unknown[] = [];
+      for (const move of appliedMoves.reverse()) try { renameSync(move.to, move.from); } catch (failure) { rollbackErrors.push(failure); }
+      for (const write of appliedWrites.reverse()) try { writeAtomic(write.file, write.before); } catch (failure) { rollbackErrors.push(failure); }
+      if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], '批量操作失败且部分文件未能恢复，请检查项目文件后再操作');
+      if (staging) rmSync(staging, { recursive: true, force: true });
+      throw error;
+    }
+    if (staging) {
+      try { rmSync(staging, { recursive: true, force: true }); }
+      catch { return { count: selected.length, warning: `用例已删除，但临时备份未能清理：${staging}` }; }
+    }
+    return { count: selected.length };
   }
   workflowLocation(projectId: string, caseId: string, workflowId: string): { file: string; platform: string } {
     const { project, item, file } = this.caseLocation(projectId, caseId);
