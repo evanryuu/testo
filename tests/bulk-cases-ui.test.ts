@@ -207,3 +207,108 @@ test('native dragging moves a selection to a sidebar Suite, supports cancellatio
     console.log('Case drag evidence:', directory);
   } finally { await app?.close(); }
 });
+
+test('marquee selects intersecting cases, supports additive selection, cancellation, scrolling and moving the result', { timeout: 60000 }, async () => {
+  mkdirSync('artifacts', { recursive: true });
+  const directory = mkdtempSync(path.resolve('artifacts/marquee-cases-ui-'));
+  let app: ElectronApplication | undefined;
+  try {
+    app = await electron.launch({ args: [process.cwd()], env: {
+      ...Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'ELECTRON_RUN_AS_NODE')),
+      WORKSPACE_DATA_DIR: path.join(directory, 'data'), WORKSPACE_PROJECTS_DIR: path.join(directory, 'projects'),
+    } });
+    const page = await app.firstWindow(), errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.getByRole('button', { name: '新建项目', exact: true }).waitFor();
+    await app.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]!; window.setContentSize(1200, 900); window.setIgnoreMouseEvents(true); });
+    const fixture = await page.evaluate(async () => {
+      const projectId = await window.workspace.createProject({ name: 'Marquee fixture', description: '' });
+      const source = (await window.workspace.state()).projects[0]!.suites[0]!.id;
+      const target = await window.workspace.createSuite({ projectId, name: 'Target' });
+      for (const name of ['Case A', 'Case B', 'Case C', 'Case D']) await window.workspace.createCase({ projectId, name, suiteId: source, platforms: ['web'] });
+      return { projectId, source, target };
+    });
+    await page.getByRole('button', { name: /Marquee fixture/ }).click();
+    const [first, second, third, fourth] = await page.getByTestId('case-list-row').locator('strong').allTextContents() as [string, string, string, string];
+    const row = (name: string) => page.getByTestId('case-list-row').filter({ has: page.getByText(name, { exact: true }) });
+    const checkbox = (name: string) => page.getByRole('checkbox', { name: '选择用例 ' + name, exact: true });
+    const selectedNames = () => page.getByTestId('case-list-row').filter({ has: page.locator('[role="checkbox"][data-state="checked"]') }).locator('strong').allTextContents();
+    async function start(name: string) {
+      const bounds = await row(name).boundingBox(); assert.ok(bounds);
+      await page.mouse.move(bounds.x - 6, bounds.y + bounds.height / 2); await page.mouse.down();
+      return bounds;
+    }
+    // Ordinary mode never starts a selection gesture.
+    const normal = await row(first).boundingBox(); assert.ok(normal);
+    await page.mouse.move(normal.x + 2, normal.y - 12); await page.mouse.down();
+    await page.mouse.move(normal.x + 100, normal.y - 4); await page.mouse.up();
+    await expect(page.getByTestId('case-selection-box')).toHaveCount(0);
+    await expect(page.getByRole('checkbox')).toHaveCount(0);
+    await page.getByRole('button', { name: '批量操作', exact: true }).click();
+    await expect(checkbox(first)).toBeVisible();
+    const a = await start(first), b = await row(second).boundingBox(); assert.ok(b);
+    await page.mouse.move(b.x + 100, b.y + 2, { steps: 6 });
+    await expect(page.getByTestId('case-selection-box')).toBeVisible();
+    await expect.poll(selectedNames).toEqual([first, second]);
+    await expect(page.getByRole('status').filter({ hasText: '正在拖动' })).toHaveCount(0);
+    await expect(page.getByRole('heading', { name: /^Test Cases/ })).toBeVisible();
+    await page.screenshot({ path: path.join(directory, 'marquee-intersection.png'), animations: 'disabled' });
+    // Shrinking the rectangle removes rows that no longer intersect it.
+    await page.mouse.move(a.x + 100, a.y + a.height - 2, { steps: 4 });
+    await expect.poll(selectedNames).toEqual([first]);
+    await page.mouse.up();
+    await expect(page.getByTestId('case-selection-box')).toHaveCount(0);
+    // Reverse direction works, including partial overlap with the first/last row.
+    await start(second);
+    await page.mouse.move(a.x + 100, a.y + a.height - 2, { steps: 6 }); await page.mouse.up();
+    await expect.poll(selectedNames).toEqual([first, second]);
+    await page.keyboard.down('Meta');
+    const c = await start(third);
+    await page.mouse.move(c.x + 80, c.y + c.height - 2, { steps: 6 }); await page.mouse.up();
+    await page.keyboard.up('Meta');
+    await expect.poll(selectedNames).toEqual([first, second, third]);
+    // Ctrl also adds to the selection; Esc restores the selection from before the gesture.
+    await page.keyboard.down('Control');
+    const d = await start(fourth);
+    await page.mouse.move(d.x + 80, d.y + d.height - 2, { steps: 6 });
+    await expect.poll(selectedNames).toEqual([first, second, third, fourth]);
+    await page.keyboard.press('Escape'); await page.mouse.up(); await page.keyboard.up('Control');
+    await expect.poll(selectedNames).toEqual([first, second, third]);
+    await expect(page.getByTestId('case-selection-box')).toHaveCount(0);
+    // The selected result can be moved using the existing native drag interaction.
+    const source = await row(first).getByRole('button').boundingBox();
+    const target = await page.locator(`[data-testid="suite-drop-target"][data-suite-id="${fixture.target}"]`).boundingBox();
+    assert.ok(source && target);
+    await page.mouse.move(source.x + 70, source.y + source.height / 2); await page.mouse.down();
+    await page.mouse.move(source.x + 85, source.y + source.height / 2, { steps: 4 });
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 12 });
+    await page.mouse.move(target.x + target.width / 2 + 1, target.y + target.height / 2);
+    await expect(page.getByRole('status').filter({ hasText: '正在拖动 3 个用例' })).toBeVisible();
+    await page.mouse.up();
+    await expect.poll(() => page.evaluate(async () => Object.fromEntries((await window.workspace.state()).projects[0]!.cases.map(item => [item.name, item.suiteId])))).toEqual( { [first]: fixture.target, [second]: fixture.target, [third]: fixture.target, [fourth]: fixture.source });
+    // A rectangle that stays in the gutter intersects no row and clears selection.
+    await start(first); await page.mouse.move(a.x - 2, b.y + 5, { steps: 6 }); await page.mouse.up();
+    await expect.poll(selectedNames).toEqual([]);
+    await checkbox(fourth).check();
+    await expect.poll(selectedNames).toEqual([fourth]);
+    // A long list stays selectable while the user scrolls with the mouse held down.
+    await page.evaluate(async () => {
+      const project = (await window.workspace.state()).projects[0]!;
+      for (let index = 0; index < 20; index++) await window.workspace.createCase({ projectId: project.id, name: `Long ${index}`, suiteId: project.suites[0]!.id, platforms: ['web'] });
+    });
+    await page.getByRole('button', { name: '刷新', exact: true }).click();
+    await expect(page.getByTestId('case-list-row')).toHaveCount(24);
+    const topName = await page.getByTestId('case-list-row').first().locator('strong').innerText();
+    await row(topName).scrollIntoViewIfNeeded();
+    const anchor = await start(topName);
+    await page.mouse.move(anchor.x + 90, anchor.y + anchor.height, { steps: 6 });
+    const count = (await selectedNames()).length;
+    await page.mouse.wheel(0, 350);
+    await expect.poll(async () => (await selectedNames()).length).toBeGreaterThan(count);
+    await page.keyboard.press('Escape'); await page.mouse.up();
+    await expect.poll(selectedNames).toEqual([fourth]);
+    await expect(page.getByTestId('case-selection-box')).toHaveCount(0);
+    assert.deepEqual(errors, []);
+    console.log('Marquee UI evidence:', directory);
+  } finally { await app?.close(); }
+});
