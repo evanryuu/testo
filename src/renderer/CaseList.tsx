@@ -13,8 +13,8 @@ type Kind = BulkCaseOperation['kind'];
 const labels: Record<Kind, string> = { delete: '删除用例', moveSuite: '移动到 Suite', addGroup: '加入 Group', removeGroup: '从 Group 移除' };
 const columns = 'grid grid-cols-[minmax(180px,1fr)_140px_60px_100px_16px] items-center gap-3';
 
-export function CaseList({ project, cases, blocked, renderCase, empty, onOpen, onRun, onChanged, onDragCases }: {
-  project: Project; cases: TestCase[]; blocked: boolean; renderCase: (item: TestCase) => ReactNode;
+export function CaseList({ project, cases, blocked, bulkMode, onExitBulkMode, renderCase, empty, onOpen, onRun, onChanged, onDragCases }: {
+  project: Project; cases: TestCase[]; blocked: boolean; bulkMode: boolean; onExitBulkMode: () => void; renderCase: (item: TestCase) => ReactNode;
   empty: ReactNode; onOpen: (item: TestCase) => void; onRun: (ids: string[]) => void; onChanged: () => Promise<void>; onDragCases: (cases: TestCase[] | null) => void;
 }) {
   const dragging = useRef(false);
@@ -52,7 +52,7 @@ export function CaseList({ project, cases, blocked, renderCase, empty, onOpen, o
   const targetSuites = project.suites.filter(suite => confirmation?.cases.some(item => item.suiteId !== suite.id));
   return <div className="space-y-3">
     {notice && <p role="status" className="text-sm text-muted-foreground">{notice}</p>}
-    <div className="sticky top-[72px] z-20 flex flex-wrap items-center gap-2 rounded-lg border bg-card p-3 shadow-sm" aria-label="用例批量操作">
+    {bulkMode && <div className="sticky top-[72px] z-20 flex flex-wrap items-center gap-2 rounded-lg border bg-card p-3 shadow-sm" aria-label="用例批量操作">
       <span className="mr-2 text-sm" role="status">已选 {selected.length} 个用例</span>
       <Button size="sm" variant="ghost" disabled={!selected.length || working} onClick={() => setSelection(new Set())}>清空选择</Button>
       <Button size="sm" variant="outline" disabled={!selected.length || unavailable} onClick={() => onRun(selected.map(item => item.id))}><Play />运行所选</Button>
@@ -60,13 +60,14 @@ export function CaseList({ project, cases, blocked, renderCase, empty, onOpen, o
       <Button size="sm" variant="outline" disabled={!selected.length || unavailable} onClick={() => open('addGroup')}><Layers3 />加入 Group</Button>
       <Button size="sm" variant="outline" disabled={!selected.length || unavailable} onClick={() => open('removeGroup')}>从 Group 移除</Button>
       <Button size="sm" variant="outline" className="text-destructive" disabled={!selected.length || unavailable} onClick={() => open('delete')}><Trash2 />删除所选</Button>
+      <Button size="sm" variant="ghost" className="ml-auto" disabled={working} onClick={onExitBulkMode}>退出批量操作</Button>
       {blocked && <p className="w-full text-xs text-muted-foreground">请先结束运行、连接或保存 / 放弃录制，再批量操作。</p>}
-    </div>
+    </div>}
     <Card className="gap-0 overflow-hidden py-0">
       <div ref={attachOverlayScrollbars} className="overflow-x-auto">
         <div className="min-w-[680px]">
           <div className="flex items-center border-b bg-muted/40 text-xs text-muted-foreground">
-            <div className="flex w-12 shrink-0 justify-center"><Checkbox aria-label="选择全部筛选结果" disabled={!cases.length || working} checked={selected.length > 0 && selected.length === cases.length ? true : selected.length ? 'indeterminate' : false} onCheckedChange={checked => setSelection(checked ? new Set(cases.map(item => item.id)) : new Set())} /></div>
+            {bulkMode && <div className="flex w-12 shrink-0 justify-center"><Checkbox aria-label="选择全部筛选结果" disabled={!cases.length || working} checked={selected.length > 0 && selected.length === cases.length ? true : selected.length ? 'indeterminate' : false} onCheckedChange={checked => setSelection(checked ? new Set(cases.map(item => item.id)) : new Set())} /></div>}
             <div className={`${columns} flex-1 px-3 py-3`}><span>用例名称</span><span>平台</span><span>优先级</span><span>最近运行</span><span /></div>
           </div>
           {cases.map(item => <div key={item.id} data-testid="case-list-row" draggable={!unavailable} onDragStart={event => {
@@ -77,13 +78,13 @@ export function CaseList({ project, cases, blocked, renderCase, empty, onOpen, o
             dragging.current = true;
             onDragCases(moving);
           }} onDragEnd={() => { onDragCases(null); }} className={`flex items-center border-b last:border-b-0 ${selection.has(item.id) ? 'bg-primary/5' : ''} ${unavailable ? '' : 'cursor-grab active:cursor-grabbing'}`}>
-            <div className="flex w-12 shrink-0 justify-center"><Checkbox aria-label={`选择用例 ${item.name}`} disabled={working} checked={selection.has(item.id)} onCheckedChange={checked => setSelection(current => { const next = new Set(current); if (checked) next.add(item.id); else next.delete(item.id); return next; })} /></div>
+            {bulkMode && <div className="flex w-12 shrink-0 justify-center"><Checkbox aria-label={`选择用例 ${item.name}`} disabled={working} checked={selection.has(item.id)} onCheckedChange={checked => setSelection(current => { const next = new Set(current); if (checked) next.add(item.id); else next.delete(item.id); return next; })} /></div>}
             <Button variant="ghost" className={`${columns} h-auto min-w-0 flex-1 rounded-none px-3 py-4 text-left font-normal`} onPointerDown={() => { dragging.current = false; }} onKeyDown={() => { dragging.current = false; }} onClick={() => { if (!dragging.current) onOpen(item); }}>{renderCase(item)}</Button>
           </div>)}
         </div>
       </div>
       {!cases.length && empty}
-      <div className="flex flex-wrap justify-between gap-2 border-t px-5 py-3 text-xs text-muted-foreground"><span>{cases.length} 个用例</span><span>可拖到左侧 Suite 移动。全选仅包含筛选结果；切换筛选会清空选择。</span></div>
+      <div className="flex flex-wrap justify-between gap-2 border-t px-5 py-3 text-xs text-muted-foreground"><span>{cases.length} 个用例</span><span>可拖到左侧 Suite 移动。{bulkMode && '全选仅包含筛选结果；切换筛选会清空选择。'}</span></div>
     </Card>
     <Dialog open={!!confirmation} onOpenChange={open => { if (!open && !working) setConfirmation(undefined); }}>
       <DialogContent showCloseButton={!working} className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden p-0">

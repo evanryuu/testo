@@ -27,7 +27,18 @@ test('case multi-selection supports filtered actions, confirmation, real Suite/G
       return { projectId, target, group, root: original.root };
     });
     await page.getByRole('button', { name: /Bulk UI/ }).click();
+    await expect(page.getByRole('checkbox')).toHaveCount(0);
+    await expect(page.getByLabel('用例批量操作', { exact: true })).toHaveCount(0);
+    await page.screenshot({ path: path.join(directory, 'normal-list.png'), animations: 'disabled' });
+    await page.getByRole('button', { name: '批量操作', exact: true }).click();
     const checkbox = page.getByRole('checkbox', { name: '选择用例 Alpha create', exact: true });
+    await checkbox.check();
+    await page.getByRole('button', { name: '退出批量操作', exact: true }).click();
+    await expect(page.getByRole('checkbox')).toHaveCount(0);
+    await expect(page.getByLabel('用例批量操作', { exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: '批量操作', exact: true }).click();
+    await expect(checkbox).not.toBeChecked();
+    await expect(page.getByRole('status').filter({ hasText: '已选 0 个用例' })).toBeVisible();
     await checkbox.check();
     await expect(page.getByRole('heading', { name: /^Test Cases/ })).toBeVisible();
     await expect(page.getByRole('checkbox', { name: '选择全部筛选结果', exact: true })).toHaveAttribute('data-state', 'indeterminate');
@@ -88,6 +99,8 @@ test('case multi-selection supports filtered actions, confirmation, real Suite/G
     await page.getByRole('button', { name: '运行所选', exact: true }).click();
     await expect(page.getByRole('heading', { name: '批量运行', exact: true })).toBeVisible();
     await page.getByRole('button', { name: /^Test Cases/ }).click();
+    await expect(page.getByRole('checkbox')).toHaveCount(0);
+    await page.getByRole('button', { name: '批量操作', exact: true }).click();
     await page.evaluate(async () => {
       const project = (await window.workspace.state()).projects[0]!;
       for (let index = 0; index < 30; index++) await window.workspace.createCase({ projectId: project.id, name: 'Long list ' + index, suiteId: project.suites[0]!.id, platforms: ['web'] });
@@ -136,7 +149,7 @@ test('native dragging moves a selection to a sidebar Suite, supports cancellatio
     });
     await page.getByRole('button', { name: /Drag fixture/ }).click();
     const suite = (id: string) => page.locator(`[data-testid="suite-drop-target"][data-suite-id="${id}"]`);
-    const row = (name: string) => page.getByTestId('case-list-row').filter({ has: page.getByRole('checkbox', { name: '选择用例 ' + name, exact: true }) });
+    const row = (name: string) => page.getByTestId('case-list-row').filter({ has: page.getByText(name, { exact: true }) });
     async function dragOver(name: string, targetId: string) {
       const source = await row(name).getByRole('button').boundingBox(), target = await suite(targetId).boundingBox();
       assert.ok(source && target);
@@ -147,6 +160,7 @@ test('native dragging moves a selection to a sidebar Suite, supports cancellatio
       await page.mouse.move(target.x + target.width / 2 + 1, target.y + target.height / 2);
     }
     async function assignments() { return page.evaluate(async () => Object.fromEntries((await window.workspace.state()).projects[0]!.cases.map(item => [item.name, item.suiteId]))); }
+    await page.getByRole('button', { name: '批量操作', exact: true }).click();
     await page.getByRole('checkbox', { name: '选择用例 Drag A', exact: true }).check();
     await page.getByRole('checkbox', { name: '选择用例 Drag B', exact: true }).check();
     await dragOver('Drag A', fixture.target);
@@ -157,7 +171,9 @@ test('native dragging moves a selection to a sidebar Suite, supports cancellatio
     await page.mouse.up();
     await expect.poll(assignments).toEqual({ 'Drag A': fixture.target, 'Drag B': fixture.target, 'Drag C': fixture.source });
     await expect(page.getByRole('dialog')).toHaveCount(0);
-    // Dragging an unselected row must not move the existing selection.
+    // Returning to normal mode clears the selection; single-row dragging still works.
+    await page.getByRole('button', { name: '退出批量操作', exact: true }).click();
+    await expect(page.getByRole('checkbox')).toHaveCount(0);
     await dragOver('Drag C', fixture.target); await page.mouse.up();
     await expect.poll(assignments).toEqual({ 'Drag A': fixture.target, 'Drag B': fixture.target, 'Drag C': fixture.target });
     await expect(suite(fixture.target)).not.toHaveAttribute('data-drag-over', 'true');
