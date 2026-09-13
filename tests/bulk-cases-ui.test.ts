@@ -114,3 +114,80 @@ test('case multi-selection supports filtered actions, confirmation, real Suite/G
     console.log('Bulk cases UI evidence:', directory);
   } finally { await app?.close(); }
 });
+
+test('native dragging moves a selection to a sidebar Suite, supports cancellation and preserves stale cases', { timeout: 60000 }, async () => {
+  mkdirSync('artifacts', { recursive: true });
+  const directory = mkdtempSync(path.resolve('artifacts/drag-cases-ui-'));
+  let app: ElectronApplication | undefined;
+  try {
+    app = await electron.launch({ args: [process.cwd()], env: {
+      ...Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'ELECTRON_RUN_AS_NODE')),
+      WORKSPACE_DATA_DIR: path.join(directory, 'data'), WORKSPACE_PROJECTS_DIR: path.join(directory, 'projects'),
+    } });
+    const page = await app.firstWindow(), errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.getByRole('button', { name: '新建项目', exact: true }).waitFor();
+    const fixture = await page.evaluate(async () => {
+      const projectId = await window.workspace.createProject({ name: 'Drag fixture', description: '' });
+      const source = (await window.workspace.state()).projects[0]!.suites[0]!.id;
+      const target = await window.workspace.createSuite({ projectId, name: 'Knowledge' });
+      for (const name of ['Drag A', 'Drag B', 'Drag C']) await window.workspace.createCase({ projectId, name, suiteId: source, platforms: ['web'] });
+      return { projectId, source, target };
+    });
+    await page.getByRole('button', { name: /Drag fixture/ }).click();
+    const suite = (id: string) => page.locator(`[data-testid="suite-drop-target"][data-suite-id="${id}"]`);
+    const row = (name: string) => page.getByTestId('case-list-row').filter({ has: page.getByRole('checkbox', { name: '选择用例 ' + name, exact: true }) });
+    async function dragOver(name: string, targetId: string) {
+      const source = await row(name).getByRole('button').boundingBox(), target = await suite(targetId).boundingBox();
+      assert.ok(source && target);
+      await page.mouse.move(source.x + 70, source.y + source.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(source.x + 85, source.y + source.height / 2, { steps: 4 });
+      await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 12 });
+      await page.mouse.move(target.x + target.width / 2 + 1, target.y + target.height / 2);
+    }
+    async function assignments() { return page.evaluate(async () => Object.fromEntries((await window.workspace.state()).projects[0]!.cases.map(item => [item.name, item.suiteId]))); }
+    await page.getByRole('checkbox', { name: '选择用例 Drag A', exact: true }).check();
+    await page.getByRole('checkbox', { name: '选择用例 Drag B', exact: true }).check();
+    await dragOver('Drag A', fixture.target);
+    await expect(suite(fixture.target)).toHaveAttribute('data-drag-over', 'true');
+    await expect(page.getByRole('status').filter({ hasText: '正在拖动 2 个用例' })).toBeVisible();
+    await expect.poll(() => suite(fixture.target).evaluate(element => getComputedStyle(element).boxShadow)).not.toBe('none');
+    await page.screenshot({ path: path.join(directory, 'drag-hover.png'), animations: 'disabled' });
+    await page.mouse.up();
+    await expect.poll(assignments).toEqual({ 'Drag A': fixture.target, 'Drag B': fixture.target, 'Drag C': fixture.source });
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    // Dragging an unselected row must not move the existing selection.
+    await dragOver('Drag C', fixture.target); await page.mouse.up();
+    await expect.poll(assignments).toEqual({ 'Drag A': fixture.target, 'Drag B': fixture.target, 'Drag C': fixture.target });
+    await expect(suite(fixture.target)).not.toHaveAttribute('data-drag-over', 'true');
+    // Dropping back on the same Suite is a no-op.
+    const before = (await page.evaluate(() => window.workspace.state())).projects[0]!.cases;
+    await dragOver('Drag C', fixture.target); await page.mouse.up();
+    assert.deepEqual((await page.evaluate(() => window.workspace.state())).projects[0]!.cases, before);
+    await dragOver('Drag C', fixture.source);
+    await page.keyboard.press('Escape'); await page.mouse.up();
+    await expect(page.getByRole('status').filter({ hasText: '正在拖动' })).toHaveCount(0);
+    assert.deepEqual((await page.evaluate(() => window.workspace.state())).projects[0]!.cases, before);
+    await dragOver('Drag C', fixture.source);
+    const blank = await page.getByRole('heading', { name: /^Test Cases/ }).boundingBox(); assert.ok(blank);
+    await page.mouse.move(blank.x + 10, blank.y + 10, { steps: 8 }); await page.mouse.up();
+    await expect(page.getByRole('status').filter({ hasText: '正在拖动' })).toHaveCount(0);
+    assert.deepEqual((await page.evaluate(() => window.workspace.state())).projects[0]!.cases, before);
+    // File revisions captured when the drag starts are still checked by the existing API.
+    await dragOver('Drag C', fixture.source);
+    const project = (await page.evaluate(() => window.workspace.state())).projects[0]!;
+    const item = project.cases.find(item => item.name === 'Drag C')!;
+    const file = path.join(project.root, project.suites.find(s => s.id === fixture.target)!.directory, item.id, 'case.yaml');
+    writeFileSync(file, readFileSync(file, 'utf8').replace('Drag C', 'Drag C updated'));
+    await page.mouse.up();
+    await expect(page.getByRole('alert')).toContainText('修改或删除');
+    assert.equal((await assignments())['Drag C updated'], fixture.target);
+    await page.screenshot({ path: path.join(directory, 'drag-conflict.png') });
+    await page.getByRole('button', { name: '刷新', exact: true }).click();
+    await row('Drag C updated').getByRole('button').click();
+    await expect(page.getByRole('heading', { name: 'Drag C updated', exact: true })).toBeVisible();
+    assert.deepEqual(errors, []);
+    console.log('Case drag evidence:', directory);
+  } finally { await app?.close(); }
+});

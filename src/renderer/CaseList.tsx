@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { FolderInput, Layers3, LoaderCircle, Play, Trash2 } from 'lucide-react';
 import type { BulkCaseOperation, Project, TestCase } from '../shared/workspace.js';
 import { attachOverlayScrollbars } from '@/lib/scrollbars';
@@ -13,10 +13,11 @@ type Kind = BulkCaseOperation['kind'];
 const labels: Record<Kind, string> = { delete: '删除用例', moveSuite: '移动到 Suite', addGroup: '加入 Group', removeGroup: '从 Group 移除' };
 const columns = 'grid grid-cols-[minmax(180px,1fr)_140px_60px_100px_16px] items-center gap-3';
 
-export function CaseList({ project, cases, blocked, renderCase, empty, onOpen, onRun, onChanged }: {
+export function CaseList({ project, cases, blocked, renderCase, empty, onOpen, onRun, onChanged, onDragCases }: {
   project: Project; cases: TestCase[]; blocked: boolean; renderCase: (item: TestCase) => ReactNode;
-  empty: ReactNode; onOpen: (item: TestCase) => void; onRun: (ids: string[]) => void; onChanged: () => Promise<void>;
+  empty: ReactNode; onOpen: (item: TestCase) => void; onRun: (ids: string[]) => void; onChanged: () => Promise<void>; onDragCases: (cases: TestCase[] | null) => void;
 }) {
+  const dragging = useRef(false);
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [confirmation, setConfirmation] = useState<{ kind: Kind; cases: TestCase[]; groups: NonNullable<Project['groups']> }>();
   const [target, setTarget] = useState(''), [working, setWorking] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState('');
@@ -68,14 +69,21 @@ export function CaseList({ project, cases, blocked, renderCase, empty, onOpen, o
             <div className="flex w-12 shrink-0 justify-center"><Checkbox aria-label="选择全部筛选结果" disabled={!cases.length || working} checked={selected.length > 0 && selected.length === cases.length ? true : selected.length ? 'indeterminate' : false} onCheckedChange={checked => setSelection(checked ? new Set(cases.map(item => item.id)) : new Set())} /></div>
             <div className={`${columns} flex-1 px-3 py-3`}><span>用例名称</span><span>平台</span><span>优先级</span><span>最近运行</span><span /></div>
           </div>
-          {cases.map(item => <div key={item.id} data-testid="case-list-row" className={`flex items-center border-b last:border-b-0 ${selection.has(item.id) ? 'bg-primary/5' : ''}`}>
+          {cases.map(item => <div key={item.id} data-testid="case-list-row" draggable={!unavailable} onDragStart={event => {
+            if (unavailable) { event.preventDefault(); return; }
+            const moving = selection.has(item.id) ? selected : [item];
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('application/x-testo-cases', project.id);
+            dragging.current = true;
+            onDragCases(moving);
+          }} onDragEnd={() => { onDragCases(null); }} className={`flex items-center border-b last:border-b-0 ${selection.has(item.id) ? 'bg-primary/5' : ''} ${unavailable ? '' : 'cursor-grab active:cursor-grabbing'}`}>
             <div className="flex w-12 shrink-0 justify-center"><Checkbox aria-label={`选择用例 ${item.name}`} disabled={working} checked={selection.has(item.id)} onCheckedChange={checked => setSelection(current => { const next = new Set(current); if (checked) next.add(item.id); else next.delete(item.id); return next; })} /></div>
-            <Button variant="ghost" className={`${columns} h-auto min-w-0 flex-1 rounded-none px-3 py-4 text-left font-normal`} onClick={() => onOpen(item)}>{renderCase(item)}</Button>
+            <Button variant="ghost" className={`${columns} h-auto min-w-0 flex-1 rounded-none px-3 py-4 text-left font-normal`} onPointerDown={() => { dragging.current = false; }} onKeyDown={() => { dragging.current = false; }} onClick={() => { if (!dragging.current) onOpen(item); }}>{renderCase(item)}</Button>
           </div>)}
         </div>
       </div>
       {!cases.length && empty}
-      <div className="flex flex-wrap justify-between gap-2 border-t px-5 py-3 text-xs text-muted-foreground"><span>{cases.length} 个用例</span><span>全选仅包含当前筛选结果；切换筛选会清空选择。</span></div>
+      <div className="flex flex-wrap justify-between gap-2 border-t px-5 py-3 text-xs text-muted-foreground"><span>{cases.length} 个用例</span><span>可拖到左侧 Suite 移动。全选仅包含筛选结果；切换筛选会清空选择。</span></div>
     </Card>
     <Dialog open={!!confirmation} onOpenChange={open => { if (!open && !working) setConfirmation(undefined); }}>
       <DialogContent showCloseButton={!working} className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden p-0">
