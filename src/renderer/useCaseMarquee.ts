@@ -1,16 +1,17 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent, type PointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type DragEvent, type MouseEvent, type PointerEvent } from 'react';
 
 type Point = { x: number; y: number };
 type Box = { left: number; top: number; width: number; height: number };
 type Gesture = {
   pointerId: number; origin: Point; client: Point; initialClient: Point;
-  original: Set<string>; additive: boolean; moved: boolean;
+  original: Set<string>; additive: boolean; moved: boolean; caseId?: string;
 };
 
 // Keep the anchor in list coordinates so scrolling does not change where the drag began.
 export function useCaseMarquee(enabled: boolean, selection: Set<string>, onSelect: (ids: Set<string>) => void) {
   const ref = useRef<HTMLDivElement>(null);
   const gesture = useRef<Gesture | null>(null);
+  const consumeClick = useRef(false);
   const [box, setBox] = useState<Box | null>(null);
   const update = useCallback(() => {
     const current = gesture.current, list = ref.current;
@@ -35,7 +36,13 @@ export function useCaseMarquee(enabled: boolean, selection: Set<string>, onSelec
     if (!current) return;
     gesture.current = null;
     if (cancel) onSelect(current.original);
-    else if (!current.moved && !current.additive) onSelect(new Set());
+    else if (!current.moved) {
+      if (current.caseId) {
+        const next = new Set(current.original);
+        if (next.has(current.caseId)) next.delete(current.caseId); else next.add(current.caseId);
+        onSelect(next);
+      } else if (!current.additive) onSelect(new Set());
+    }
     setBox(null);
     if (ref.current?.hasPointerCapture(current.pointerId)) ref.current.releasePointerCapture(current.pointerId);
   }, [onSelect]);
@@ -59,14 +66,22 @@ export function useCaseMarquee(enabled: boolean, selection: Set<string>, onSelec
   return {
     ref, box,
     onPointerDown(event: PointerEvent<HTMLDivElement>) {
+      consumeClick.current = false;
       if (!enabled || event.button !== 0 || event.pointerType !== 'mouse'
-        || !(event.target instanceof Element) || event.target.closest('button, a, input, textarea, select, label, [role="checkbox"], [contenteditable], .os-scrollbar')) return;
+        || !(event.target instanceof Element) || event.target.closest('button:not([data-case-select]), a, input, textarea, select, label, [role="checkbox"], [contenteditable], .os-scrollbar')) return;
       event.preventDefault();
+      consumeClick.current = true;
+      event.target.closest<HTMLElement>('[data-case-select]')?.focus({ preventScroll: true });
       const bounds = event.currentTarget.getBoundingClientRect();
       gesture.current = { pointerId: event.pointerId, origin: { x: event.clientX - bounds.left, y: event.clientY - bounds.top },
-        client: { x: event.clientX, y: event.clientY }, initialClient: { x: event.clientX, y: event.clientY }, original: new Set(selection), additive: event.metaKey || event.ctrlKey, moved: false };
+        client: { x: event.clientX, y: event.clientY }, initialClient: { x: event.clientX, y: event.clientY }, original: new Set(selection), additive: event.metaKey || event.ctrlKey, moved: false, caseId: event.target.closest<HTMLElement>('[data-case-id]')?.dataset.caseId };
       event.currentTarget.setPointerCapture(event.pointerId);
     },
+    onClickCapture(event: MouseEvent<HTMLDivElement>) {
+      // Pointer-up already applied the selection. Do not toggle again or open the case.
+      if (consumeClick.current) { consumeClick.current = false; event.preventDefault(); event.stopPropagation(); }
+    },
+    onKeyDownCapture() { if (!gesture.current) consumeClick.current = false; },
     onPointerMove(event: PointerEvent<HTMLDivElement>) {
       if (gesture.current?.pointerId !== event.pointerId) return;
       gesture.current.client = { x: event.clientX, y: event.clientY };

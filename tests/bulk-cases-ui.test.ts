@@ -151,11 +151,12 @@ test('native dragging moves a selection to a sidebar Suite, supports cancellatio
     const suite = (id: string) => page.locator(`[data-testid="suite-drop-target"][data-suite-id="${id}"]`);
     const row = (name: string) => page.getByTestId('case-list-row').filter({ has: page.getByText(name, { exact: true }) });
     async function dragOver(name: string, targetId: string) {
-      const source = await row(name).getByRole('button').boundingBox(), target = await suite(targetId).boundingBox();
+      const handle = row(name).getByRole('button', { name: '拖动用例 ' + name, exact: true });
+      const source = await (await handle.count() ? handle : row(name).getByRole('button')).boundingBox(), target = await suite(targetId).boundingBox();
       assert.ok(source && target);
-      await page.mouse.move(source.x + 70, source.y + source.height / 2);
+      await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
       await page.mouse.down();
-      await page.mouse.move(source.x + 85, source.y + source.height / 2, { steps: 4 });
+      await page.mouse.move(source.x + source.width / 2 + 15, source.y + source.height / 2, { steps: 4 });
       await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 12 });
       await page.mouse.move(target.x + target.width / 2 + 1, target.y + target.height / 2);
     }
@@ -233,9 +234,9 @@ test('marquee selects intersecting cases, supports additive selection, cancellat
     const row = (name: string) => page.getByTestId('case-list-row').filter({ has: page.getByText(name, { exact: true }) });
     const checkbox = (name: string) => page.getByRole('checkbox', { name: '选择用例 ' + name, exact: true });
     const selectedNames = () => page.getByTestId('case-list-row').filter({ has: page.locator('[role="checkbox"][data-state="checked"]') }).locator('strong').allTextContents();
-    async function start(name: string) {
+    async function start(name: string, gutter = false) {
       const bounds = await row(name).boundingBox(); assert.ok(bounds);
-      await page.mouse.move(bounds.x - 6, bounds.y + bounds.height / 2); await page.mouse.down();
+      await page.mouse.move(gutter ? bounds.x - 6 : bounds.x + 190, bounds.y + bounds.height / 2); await page.mouse.down();
       return bounds;
     }
     // Ordinary mode never starts a selection gesture.
@@ -246,6 +247,17 @@ test('marquee selects intersecting cases, supports additive selection, cancellat
     await expect(page.getByRole('checkbox')).toHaveCount(0);
     await page.getByRole('button', { name: '批量操作', exact: true }).click();
     await expect(checkbox(first)).toBeVisible();
+    // Clicking the row is selection in bulk mode, not navigation.
+    const content = (name: string) => row(name).getByRole('button').filter({ has: page.getByText(name, { exact: true }) });
+    await content(first).click();
+    await expect(checkbox(first)).toBeChecked();
+    await expect(page.getByRole('heading', { name: /^Test Cases/ })).toBeVisible();
+    await content(first).click();
+    await expect(checkbox(first)).not.toBeChecked();
+    await content(first).focus(); await page.keyboard.press('Space');
+    await expect(checkbox(first)).toBeChecked();
+    await page.keyboard.press('Enter');
+    await expect(checkbox(first)).not.toBeChecked();
     const a = await start(first), b = await row(second).boundingBox(); assert.ok(b);
     await page.mouse.move(b.x + 100, b.y + 2, { steps: 6 });
     await expect(page.getByTestId('case-selection-box')).toBeVisible();
@@ -276,18 +288,18 @@ test('marquee selects intersecting cases, supports additive selection, cancellat
     await expect.poll(selectedNames).toEqual([first, second, third]);
     await expect(page.getByTestId('case-selection-box')).toHaveCount(0);
     // The selected result can be moved using the existing native drag interaction.
-    const source = await row(first).getByRole('button').boundingBox();
+    const source = await row(first).getByRole('button', { name: '拖动用例 ' + first, exact: true }).boundingBox();
     const target = await page.locator(`[data-testid="suite-drop-target"][data-suite-id="${fixture.target}"]`).boundingBox();
     assert.ok(source && target);
-    await page.mouse.move(source.x + 70, source.y + source.height / 2); await page.mouse.down();
-    await page.mouse.move(source.x + 85, source.y + source.height / 2, { steps: 4 });
+    await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2); await page.mouse.down();
+    await page.mouse.move(source.x + source.width / 2 + 15, source.y + source.height / 2, { steps: 4 });
     await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 12 });
     await page.mouse.move(target.x + target.width / 2 + 1, target.y + target.height / 2);
     await expect(page.getByRole('status').filter({ hasText: '正在拖动 3 个用例' })).toBeVisible();
     await page.mouse.up();
     await expect.poll(() => page.evaluate(async () => Object.fromEntries((await window.workspace.state()).projects[0]!.cases.map(item => [item.name, item.suiteId])))).toEqual( { [first]: fixture.target, [second]: fixture.target, [third]: fixture.target, [fourth]: fixture.source });
     // A rectangle that stays in the gutter intersects no row and clears selection.
-    await start(first); await page.mouse.move(a.x - 2, b.y + 5, { steps: 6 }); await page.mouse.up();
+    await start(first, true); await page.mouse.move(a.x - 2, b.y + 5, { steps: 6 }); await page.mouse.up();
     await expect.poll(selectedNames).toEqual([]);
     await checkbox(fourth).check();
     await expect.poll(selectedNames).toEqual([fourth]);
