@@ -8,6 +8,10 @@ import { GitPanel } from './GitPanel.js';
 import { WorkflowEditor } from './WorkflowEditor.js';
 import { VariableEditor } from './VariableEditor.js';
 import { AppUpdatePanel } from './AppUpdatePanel.js';
+import { DocumentImportView } from './DocumentImportView.js';
+import { KnowledgeView } from './KnowledgeView.js';
+import { ImportedStatus } from './ImportedStatus.js';
+import { runPlanFromYaml } from '../shared/run-steps.js';
 import { ProjectAssetsView } from './ProjectAssetsView.js';
 import { ChromeTabPicker } from './ChromeTabPicker.js';
 import { parseWorkflow } from '../shared/workflow-document.js';
@@ -32,7 +36,7 @@ import type { RunStepInfo } from '../shared/run-steps.js';
 import type { WorkerEvent } from '../runner/messages.js';
 import type { HistoryRun, Project, TestCase, WorkspaceState } from '../shared/workspace.js';
 
-type View = 'projects' | 'cases' | 'detail' | 'runs' | 'run' | 'environments' | 'settings' | 'recorder' | 'batch' | 'groups' | 'assets';
+type View = 'projects' | 'cases' | 'detail' | 'runs' | 'run' | 'environments' | 'settings' | 'recorder' | 'batch' | 'groups' | 'assets' | 'import' | 'knowledge';
 type Modal = { kind: 'project' | 'suite' | 'case' | 'edit' | 'environment' | 'workflow'; id?: string; text?: string; revision?: string };
 const initial: WorkspaceState = { projects: [], runs: [], model: { name: '', baseUrl: '', family: '', hasApiKey: false }, errors: [] };
 const platformNames: Record<string, string> = { web: 'Web', android: 'Android', ios: 'iOS' };
@@ -76,6 +80,7 @@ export function App() {
   const [caseBulkMode, setCaseBulkMode] = useState(false);
   const [batchGroupIds, setBatchGroupIds] = useState<string[] | undefined>();
   const [query, setQuery] = useState(''), [suite, setSuite] = useState('all'), [environmentId, setEnvironmentId] = useState('');
+  const [trialPreview, setTrialPreview] = useState<{ workflowId: string; text: string; revision: string; preconditions: { text: string; kind: 'action' | 'check' | 'manual' }[] }>();
   const [workflowValid, setWorkflowValid] = useState(true);
   const [environmentVariables, setEnvironmentVariables] = useState<Variables>({}), [environmentValid, setEnvironmentValid] = useState(true);
   const [modal, setModal] = useState<Modal | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState('');
@@ -146,7 +151,13 @@ export function App() {
     setRunId(id); setView('run');
   }
   async function start(workflowId: string, debug?: DebugSelection) {
-    await act(() => executeStart(workflowId, debug));
+    await act(async () => {
+      if (project && item && selectedEnv && !debug) {
+        const status = await window.workspace.importValidation({ projectId: project.id, caseId: item.id, workflowId, environmentId: selectedEnv.id, variables, datasetId: datasetId || undefined, browserMode, loginCondition, timeoutMs: timeoutSeconds ? Number(timeoutSeconds) * 1000 : undefined });
+        if (status.imported) { const file = await window.workspace.workflow({ projectId: project.id, caseId: item.id, workflowId }); setTrialPreview({ workflowId, ...file, preconditions: status.preconditions ?? [] }); return; }
+      }
+      await executeStart(workflowId, debug);
+    });
   }
   function openRecording() {
     if (!state.recording) return;
@@ -160,7 +171,7 @@ export function App() {
       go('recorder');
     });
   }
-  const heading = { projects: ['Projects', '在一个地方组织、维护和运行你的测试。'], cases: ['Test Cases', '按业务组织用例，为每个平台维护独立的 Workflow。'], detail: [item?.name ?? 'Test Case', ''], runs: ['Run History', '每次执行，都有记录可查。'], run: ['Run Results', '查看执行步骤和原始报告。'], environments: ['Environments', '为同一套测试切换运行环境。'], settings: ['Model Settings', '沿用 Midscene 的模型配置方式。'], recorder: ['Record Workflow', '录制、检查并保存到当前用例。'], batch: ['批量运行', '为多个用例分配登录窗口，并按顺序执行。'], groups: ['Groups', '将用例组合为分组，按成员顺序批量运行。'], assets: ['共享资源', '维护默认变量和可重复使用的步骤。'] }[view];
+  const heading = { projects: ['Projects', '在一个地方组织、维护和运行你的测试。'], cases: ['Test Cases', '按业务组织用例，为每个平台维护独立的 Workflow。'], detail: [item?.name ?? 'Test Case', ''], runs: ['Run History', '每次执行，都有记录可查。'], run: ['Run Results', '查看执行步骤和原始报告。'], environments: ['Environments', '为同一套测试切换运行环境。'], settings: ['Model Settings', '沿用 Midscene 的模型配置方式。'], recorder: ['Record Workflow', '录制、检查并保存到当前用例。'], batch: ['批量运行', '为多个用例分配登录窗口，并按顺序执行。'], groups: ['Groups', '将用例组合为分组，按成员顺序批量运行。'], assets: ['共享资源', '维护默认变量和可重复使用的步骤。'], import: ['从文档生成', '导入文档、审查用例、生成并验证 Workflow。'], knowledge: ['项目知识库', '维护页面名称、导航方法和业务知识。'] }[view];
   const filteredCases = (project?.cases ?? []).filter((c) => (suite === 'all' || c.suiteId === suite) && `${c.name} ${c.description} ${c.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase()));
   async function submit(form: FormData) {
     await act(async () => {
@@ -190,7 +201,7 @@ export function App() {
     <aside className="fixed inset-y-0 left-0 z-20 flex w-56 flex-col border-r bg-muted/50 px-3 pb-5 pt-14 xl:w-60">
       <div className="mb-8 flex items-center gap-3 px-2"><span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm"><Layers3 className="size-5" /></span><div className="text-sm font-semibold tracking-tight">Testo<small className="mt-1 block text-[11px] font-normal text-muted-foreground">Powered by Midscene</small></div></div>
       <Button variant="ghost" className={nav(view === 'projects')} onClick={() => { setProjectId(''); go('projects'); }}><LayoutGrid />Projects<Badge variant="secondary" className="ml-auto">{state.projects.length}</Badge></Button>
-      {project ? <><div className="my-5 flex items-center gap-2 rounded-lg border bg-card p-3 text-sm font-medium"><span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">{project.name.slice(0, 1).toUpperCase()}</span><span className="truncate">{project.name}</span><ChevronRight className="ml-auto size-3.5 text-muted-foreground" /></div><p className="mb-2 px-3 text-[10px] font-medium tracking-widest text-muted-foreground">WORKSPACE</p><Button variant="ghost" className={nav(view === 'cases' || view === 'detail')} onClick={() => go('cases')}><FileCode2 />Test Cases<Badge variant="secondary" className="ml-auto">{project.cases.length}</Badge></Button><Button variant="ghost" className={nav(view === 'groups')} onClick={() => go('groups')}><Layers3 />Groups</Button><Button variant="ghost" className={nav(view === 'environments')} onClick={() => go('environments')}><Box />Environments</Button><Button variant="ghost" className={nav(view === 'assets')} onClick={() => go('assets')}><Layers3 />共享资源</Button></> : null}
+      {project ? <><div className="my-5 flex items-center gap-2 rounded-lg border bg-card p-3 text-sm font-medium"><span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">{project.name.slice(0, 1).toUpperCase()}</span><span className="truncate">{project.name}</span><ChevronRight className="ml-auto size-3.5 text-muted-foreground" /></div><p className="mb-2 px-3 text-[10px] font-medium tracking-widest text-muted-foreground">WORKSPACE</p><Button variant="ghost" className={nav(view === 'cases' || view === 'detail')} onClick={() => go('cases')}><FileCode2 />Test Cases<Badge variant="secondary" className="ml-auto">{project.cases.length}</Badge></Button><Button variant="ghost" className={nav(view === 'groups')} onClick={() => go('groups')}><Layers3 />Groups</Button><Button variant="ghost" className={nav(view === 'environments')} onClick={() => go('environments')}><Box />Environments</Button><Button variant="ghost" className={nav(view === 'assets')} onClick={() => go('assets')}><Layers3 />共享资源</Button><Button variant="ghost" className={nav(view === 'knowledge')} onClick={() => go('knowledge')}><FileCode2 />知识库</Button></> : null}
       <Button variant="ghost" className={nav(view === 'runs' || view === 'run' || view === 'batch')} onClick={() => go('runs')}><Clock3 />Run History</Button>
       {project ? <div ref={attachOverlayScrollbars} className="mt-7 min-h-0 overflow-auto"><div className="mb-2 flex items-center justify-between px-3 text-[10px] tracking-widest text-muted-foreground">SUITES<Button variant="ghost" size="icon-xs" aria-label="新建 Suite" onClick={() => show({ kind: 'suite' })}><Plus /></Button></div>{project.suites.map((s) => <Button variant="ghost" key={s.id} data-testid="suite-drop-target" data-suite-id={s.id} data-drag-over={caseDropTarget === s.id ? 'true' : undefined} className={cn(nav(view === 'cases' && suite === s.id), caseDrag && canDropCases(s.id) && 'ring-1 ring-inset ring-primary/30', caseDropTarget === s.id && 'bg-primary/20 ring-2 ring-inset ring-primary')} onDragEnter={event => {
         if (!canDropCases(s.id) || !event.dataTransfer.types.includes('application/x-testo-cases')) return;
@@ -221,7 +232,7 @@ export function App() {
         {pendingRecording && view !== 'recorder' ? <Alert className="border-primary/20 bg-primary/5"><AlertDescription className="flex items-center justify-between gap-4"><span>{state.recording!.status === 'recording' ? '录制进行中' : '有一份录制草稿待检查'} · {state.recording!.caseName}</span><Button variant="outline" size="sm" onClick={openRecording}>打开录制</Button></AlertDescription></Alert> : null}
         {view !== 'recorder' ? <div className="flex items-center justify-between gap-5"><div className="min-w-0">{view === 'detail' || view === 'run' ? <Button variant="link" className="mb-3 h-auto p-0 text-xs text-muted-foreground" onClick={() => go(view === 'detail' ? 'cases' : 'runs')}><ArrowLeft />{view === 'detail' ? '返回用例列表' : '返回运行历史'}</Button> : null}<h1 className="flex items-center gap-3 text-2xl font-semibold tracking-tight xl:text-3xl">{heading[0]}{view === 'cases' ? <Badge variant="secondary">{project?.cases.length ?? 0}</Badge> : null}</h1>{heading[1] ? <p className="mt-2 text-sm text-muted-foreground">{heading[1]}</p> : null}</div><div className="flex shrink-0 gap-2">
           {view === 'projects' ? <><Button variant="outline" disabled={busy} onClick={() => void act(async () => { const id = await window.workspace.openProject(); if (id) { setProjectId(id); setView('cases'); } })}><FolderOpen />打开项目</Button><Button onClick={() => show({ kind: 'project' })}><Plus />新建项目</Button></> : null}
-          {view === 'cases' && project ? <>{!caseBulkMode && <Button variant="outline" onClick={() => setCaseBulkMode(true)}>批量操作</Button>}<Button variant="outline" disabled={busy} onClick={() => { setBatchCaseIds(filteredCases.map(item => item.id)); setBatchGroupIds(undefined); setBatchId(''); setView('batch'); }}><Play />批量运行</Button><Button onClick={() => show({ kind: 'case' })}><Plus />新建用例</Button></> : null}
+          {view === 'cases' && project ? <><Button variant="outline" onClick={() => go('import')}><FileCode2 />从文档生成</Button>{!caseBulkMode && <Button variant="outline" onClick={() => setCaseBulkMode(true)}>批量操作</Button>}<Button variant="outline" disabled={busy} onClick={() => { setBatchCaseIds(filteredCases.map(item => item.id)); setBatchGroupIds(undefined); setBatchId(''); setView('batch'); }}><Play />批量运行</Button><Button onClick={() => show({ kind: 'case' })}><Plus />新建用例</Button></> : null}
           {view === 'detail' && item ? <Button variant="outline" onClick={() => show({ kind: 'edit', revision: item.revision })}><Settings2 />编辑用例</Button> : null}
           {view === 'environments' && project ? <Button onClick={() => show({ kind: 'environment' })}><Plus />添加环境</Button> : null}
         </div></div> : null}
@@ -255,6 +266,7 @@ export function App() {
             </DialogContent>
           </Dialog> : null}
           {browserMode === 'bridge' && (state.sessions ?? []).some(session => session.projectId === project.id && session.environmentId === selectedEnv.id) ? <label className="space-y-2 text-sm">本次运行标签页<NativeSelect aria-label="单例运行标签页" value={sessionId} onChange={event => { setSessionId(event.target.value); setPreflight(undefined); }}><NativeSelectOption value="">请选择标签页</NativeSelectOption>{(state.sessions ?? []).filter(session => session.projectId === project.id && session.environmentId === selectedEnv.id).map(session => <NativeSelectOption key={session.id} value={session.id}>{session.name}</NativeSelectOption>)}</NativeSelect></label> : null}
+          {item.workflows.filter(workflow => workflow.platform === 'web' && workflow.ready).map(workflow => <ImportedStatus key={workflow.id} refreshKey={state} input={{ projectId: project.id, caseId: item.id, workflowId: workflow.id, environmentId: selectedEnv.id, variables, datasetId: datasetId || undefined, browserMode, loginCondition, timeoutMs: timeoutSeconds ? Number(timeoutSeconds) * 1000 : undefined }} />)}
           <Card><CardHeader><CardTitle>本次运行设置</CardTitle></CardHeader><CardContent className="space-y-5">
             <VariableEditor label="运行变量" value={variables} onChange={setVariables} onValidityChange={setVariablesValid} disabled={busy} />
             {datasets.length ? <label className="block space-y-2 text-sm">数据集<NativeSelect aria-label="运行数据集" value={datasetId} onChange={e => setDatasetId(e.target.value)}><NativeSelectOption value="">使用默认值</NativeSelectOption>{datasets.map(dataset => <NativeSelectOption key={dataset.id} value={dataset.id}>{dataset.name}</NativeSelectOption>)}</NativeSelect></label> : null}
@@ -262,6 +274,8 @@ export function App() {
             {preflight && <div className="space-y-2">{preflight.checks.map(check => <p key={check.name} className={cn('text-sm', check.status === 'failed' && 'text-destructive')}>{check.name}：{check.message}</p>)}</div>}
           </CardContent></Card>
         </> : null}
+        {view === 'import' && project ? <DocumentImportView key={project.id} project={project} onTrial={ids => { if (ids.length === 1) { setCaseId(ids[0]!); go('detail'); } else { setBatchCaseIds(ids); setBatchGroupIds(undefined); setBatchId(''); go('batch'); } }} /> : null}
+        {view === 'knowledge' && project ? <KnowledgeView key={project.id} projectId={project.id} /> : null}
         {view === 'assets' && project ? <ProjectAssetsView key={project.id} variables={project.assets?.variables ?? {}} flows={project.assets?.flows ?? {}} revision={project.assets?.revision} busy={busy} onSave={async value => {
           const saved = await window.workspace.saveAssets({ projectId: project.id, variables: value.variables, flows: value.flows, revision: value.revision ?? '' });
           await refresh(); setNotice('项目资产已保存');
@@ -285,6 +299,7 @@ export function App() {
       </div>
     </main>
     {notice ? <Alert role="status" className="fixed bottom-6 left-[calc(50%+7rem)] z-40 w-auto -translate-x-1/2 border-emerald-200 bg-card px-5 py-3 text-emerald-700 shadow-lg"><Check className="size-4" /><AlertDescription className="text-emerald-700">{notice}</AlertDescription></Alert> : null}
+    {trialPreview && project && item && selectedEnv && <Dialog open onOpenChange={open => { if (!open && !busy) setTrialPreview(undefined); }}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl"><DialogHeader><DialogTitle>确认首次或再次试跑</DialogTitle><DialogDescription>此次试跑会真实操作页面。请核对环境、会话、变量和下面的操作与断言。</DialogDescription></DialogHeader><p className="text-sm">环境：{selectedEnv.name} · {selectedEnv.web.baseUrl}</p><p className="text-sm">会话：{browserMode === 'isolated' ? '独立浏览器（未登录）' : selectedSession?.name ?? '尚未选择'}</p><p className="text-sm">运行变量：{Object.keys(variables).join('、') || '使用用例和环境默认值'}；登录检查：{loginCondition || '未额外指定'}</p>{!!trialPreview.preconditions.length && <section className="space-y-2 text-sm"><h3 className="font-medium">请核对前置条件</h3><ul className="list-disc space-y-1 pl-5">{trialPreview.preconditions.map((condition, index) => <li key={index}>{{ action: '将执行准备', check: '将检查状态', manual: '需人工完成' }[condition.kind]}：{condition.text}</li>)}</ul></section>}<ol className="max-h-80 list-decimal space-y-2 overflow-auto pl-6 text-sm">{runPlanFromYaml(parseWorkflow(trialPreview.text)).map((step, index) => <li key={index}>{step.title}{step.detail ? `：${step.detail}` : ''}</li>)}</ol>{error && <p role="alert" className="text-sm text-destructive">{error}</p>}<DialogFooter><Button variant="outline" disabled={busy} onClick={() => setTrialPreview(undefined)}>返回修改</Button><Button disabled={busy} onClick={() => void act(async () => { const current = await window.workspace.workflow({ projectId: project.id, caseId: item.id, workflowId: trialPreview.workflowId }); if (current.revision !== trialPreview.revision) throw new Error('Workflow 已修改，请关闭预览并重新核对'); await executeStart(trialPreview.workflowId); setTrialPreview(undefined); })}>确认并启动试跑</Button></DialogFooter></DialogContent></Dialog>}
     {modal ? <FormDialog valid={modal.kind === 'workflow' ? workflowValid : modal.kind === 'environment' ? environmentValid : true} wide={modal.kind === 'workflow'} title={{ project: '新建项目', suite: '新建 Suite', case: '新建测试用例', edit: '编辑测试用例', environment: '运行环境', workflow: '编辑平台 Workflow' }[modal.kind]} busy={busy} error={error} close={() => { setModal(null); setError(''); }} submit={(form) => void submit(form)}>
       {modal.kind === 'project' ? <><Field label="项目名称" id="project-name"><Input id="project-name" name="name" autoFocus required placeholder="例如 LongbridgeAI" /></Field><Field label="项目描述" id="project-description"><Textarea id="project-description" name="description" rows={3} placeholder="这个项目要测试什么？" /></Field><p className="text-xs leading-6 text-muted-foreground">创建后会生成独立的项目文件夹，测试定义以 YAML 保存。</p></> : null}
       {modal.kind === 'suite' ? <Field label="Suite 名称" id="suite-name"><Input id="suite-name" name="name" autoFocus required placeholder="例如 Chat、Authentication" /></Field> : null}

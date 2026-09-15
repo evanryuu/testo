@@ -263,7 +263,7 @@ export class WorkspaceStore {
       });
       for (const directory of directories) {
         checkTree(directory);
-        if (['workspace.yaml', 'resources.yaml', 'groups', 'environments'].some(relative => within(directory, fileIn(project.root, relative)))) throw new Error('用例目录包含项目配置，无法批量操作');
+        if (['workspace.yaml', 'resources.yaml', 'groups', 'environments', 'imports', 'knowledge.json'].some(relative => within(directory, fileIn(project.root, relative)))) throw new Error('用例目录包含项目配置，无法批量操作');
         if (project.suites.some(suite => within(directory, fileIn(project.root, suite.directory)))) throw new Error('用例目录内包含 Suite，无法批量移动或删除');
         if (directories.some(other => other !== directory && within(directory, other))) throw new Error('用例目录存在嵌套，无法批量操作');
         const reference = references.find(reference => reference.files.some(file => within(directory, file)));

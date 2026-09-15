@@ -1,10 +1,12 @@
+import { operationCatalog } from './operation-catalog.js';
+
 export interface RunStepInfo {
   metric?: 'first-response' | 'response-complete';
   node: string; phase: string; index: number; title: string; detail?: string;
   point?: { x: number; y: number }; viewport?: { width: number; height: number };
 }
 export function describeRunStep(node: string, input: any, phase: string, index: number): RunStepInfo {
-  const step: RunStepInfo = { node, phase, index, title: node };
+  const step: RunStepInfo = { node, phase, index, title: operationCatalog.find(item => item.id === node)?.name ?? node };
   if (node === 'recordedAction') {
     const p = input?.payload ?? {};
     const names: Record<string, string> = { Tap: '点击', Input: p.mode === 'clear' ? '清空输入框' : '输入文字', KeyboardPress: '按键', Scroll: '滚动', DragAndDrop: '拖动' };
@@ -16,6 +18,7 @@ export function describeRunStep(node: string, input: any, phase: string, index: 
     if (input?.actionType === 'Scroll') step.detail = `${p.direction ?? ''} ${p.distance ?? ''}`.trim();
     if (input?.actionType === 'DragAndDrop') step.detail = `拖动至（${p.endX}, ${p.endY}）`;
   } else if (node === 'gotoUrl') { step.title = '打开页面'; step.detail = typeof input === 'string' ? input : input?.url; }
+  else if (node === 'click_by_text') step.detail = typeof input === 'string' ? input : input?.text;
   else if (node === 'requireViewport' || node === 'setViewportSize') { step.title = '准备回放尺寸'; step.detail = `${input?.width} × ${input?.height}`; }
   else if (node === 'aiAct') { step.title = 'AI 操作'; step.detail = typeof input === 'string' ? input : input?.prompt; }
   else if (node === 'aiAssert' || node === 'assertText') { step.title = '检查预期结果'; step.detail = typeof input === 'string' ? input : input?.prompt ?? input?.assertion ?? input?.text; }

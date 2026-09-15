@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { isMap, isSeq, parseDocument, stringify, type YAMLSeq } from 'yaml';
+import { isMap, isSeq, parseDocument, stringify, type YAMLSeq, type Node } from 'yaml';
 import { ArrowDown, ArrowUp, Copy, Plus, Redo2, Trash2, Undo2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Checkbox } from '@/components/ui/checkbox';
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
+import { NativeSelect, NativeSelectOptGroup, NativeSelectOption } from '@/components/ui/native-select';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { operationCatalog, operationGroups, operationId, createOperationStep } from '../shared/operation-catalog.js';
 import { checkTemplates } from '../shared/check-templates.js';
 import { VariableEditor, type JsonValue } from './VariableEditor';
 
@@ -23,21 +24,10 @@ const phases: [Phase, string][] = [['steps', '用例步骤'], ['beforeAll', '运
 const phasePath = (phase: Phase): (string | number)[] => phase === 'steps' ? ['cases', 0, 'steps'] : [phase];
 const objectValue = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const operation = (step: Record<string, unknown>) => Object.keys(step).find(key => key !== '$' && key !== 'testo') ?? '';
-const rawNames: Record<string, string> = { Tap: '点击', Input: '输入文字', KeyboardPress: '按键', Scroll: '滚动', DragAndDrop: '拖拽' };
-const nodeNames: Record<string, string> = { gotoUrl: '打开页面', aiAct: 'AI 操作', aiTap: 'AI 点击', aiInput: 'AI 输入', aiKeyboardPress: 'AI 按键', aiScroll: 'AI 滚动', aiWaitFor: '等待条件', aiAssert: 'AI 断言', assertText: '检查可见文本', recordToReport: '保存报告截图', waitForElement: '等待元素', requireViewport: '准备视口', setViewportSize: '设置视口', useFlow: '共享步骤', wait: '固定等待' };
-const titleFor = (step: Record<string, unknown>) => String(objectValue(step.testo).name || (operation(step) === 'recordedAction' ? rawNames[String(objectValue(step.recordedAction).actionType)] : nodeNames[operation(step)]) || operation(step) || '未知步骤');
-const defaults: Record<string, Record<string, unknown>> = {
-  Tap: { recordedAction: { actionType: 'Tap', payload: { x: 0, y: 0 } } },
-  Input: { recordedAction: { actionType: 'Input', payload: { value: '', mode: 'typeOnly' } } },
-  KeyboardPress: { recordedAction: { actionType: 'KeyboardPress', payload: { keyName: 'Enter' } } },
-  Scroll: { recordedAction: { actionType: 'Scroll', payload: { direction: 'down', distance: 500 } } },
-  DragAndDrop: { recordedAction: { actionType: 'DragAndDrop', payload: { x: 0, y: 0, endX: 100, endY: 100 } } },
-  gotoUrl: { gotoUrl: { url: '${baseUrl}' } }, aiAct: { aiAct: '' }, aiTap: { aiTap: '' },
-  aiWaitFor: { aiWaitFor: { prompt: '', timeoutMs: 60000 } }, aiAssert: { aiAssert: '' },
-  assertText: { assertText: { text: '', timeoutMs: 5000 } }, recordToReport: { recordToReport: '当前页面' },
-  waitForElement: { waitForElement: { selector: '', state: 'visible', timeoutMs: 30000 } },
-  wait: { wait: { duration: 1000, unit: 'ms' } },
-};
+const titleFor = (step: Record<string, unknown>) => String(objectValue(step.testo).name || operationCatalog.find(item => item.id === operationId(step))?.name || (operation(step) === 'useFlow' ? '共享步骤' : operation(step)) || '未知步骤');
+function OperationOptions() {
+  return <>{operationGroups.map(group => <NativeSelectOptGroup key={group} label={group}>{operationCatalog.filter(item => item.group === group).map(item => <NativeSelectOption key={item.id} value={item.id}>{item.name} · {item.id}</NativeSelectOption>)}</NativeSelectOptGroup>)}</>;
+}
 
 export function WorkflowEditor({ text, onChange, onDebug, onRecord, flows = {}, disabled = false, scope = 'workflow', onValidityChange }: Props) {
   const [phase, setPhase] = useState<Phase>('steps');
@@ -95,10 +85,47 @@ export function WorkflowEditor({ text, onChange, onDebug, onRecord, flows = {}, 
       const input = doc.getIn(inputPath);
       if (path.length > 1 && typeof input === 'string') {
         const shorthand: Record<string, string> = { aiWaitFor: 'prompt', aiAssert: 'prompt', aiAct: 'prompt', aiTap: 'prompt', assertText: 'text', gotoUrl: 'url', recordToReport: 'title' };
-        const key = shorthand[String(path[0])];
+        const key = shorthand[String(path[0])] ?? (path[0] === 'aiKeyboardPress' ? 'keyName' : operationCatalog.find(item => item.id === path[0])?.fields?.[0]?.key);
         if (key) doc.setIn(inputPath, doc.createNode({ [key]: input }));
       }
-      doc.setIn([...phasePath(phase), index, ...path], value);
+      const fieldPath = [...phasePath(phase), index, ...path];
+      if (value === undefined) {
+        doc.deleteIn(fieldPath);
+        if (path[1] === 'target') {
+          const targetPath = [...phasePath(phase), index, 'recordedAction', 'target'];
+          const target = doc.getIn(targetPath, true);
+          if (isMap(target) && !target.items.length) doc.deleteIn(targetPath);
+        }
+      } else doc.setIn(fieldPath, value);
+    });
+  }
+  function changeOperation(index: number, id: string) {
+    if (operationId(steps[index]!) === id) return;
+    edit(doc => {
+      const previous = steps[index]!, oldNode = operation(previous);
+      const replacement = id === 'useFlow' ? { useFlow: { id: Object.keys(flows)[0] ?? '' } } : createOperationStep(id);
+      const newNode = operation(replacement), newInput = objectValue(replacement[newNode]);
+      const oldInput = objectValue(previous[oldNode]);
+      // Carry only the target/value with a matching meaning; unrelated parameters use defaults.
+      if (oldNode === 'recordedAction') {
+        const target = objectValue(oldInput.target), payload = objectValue(oldInput.payload);
+        if (id === 'click_by_text' && target.name) newInput.text = target.name;
+        if (id === 'click_by_role') { if (target.name) newInput.name = target.name; if (target.role) newInput.role = target.role; }
+        if (id === 'click_by_test_id' && target.testId) newInput.testId = target.testId;
+        if (id === 'aiInput' && typeof payload.value === 'string') newInput.value = payload.value;
+        if (id.startsWith('ai') && 'prompt' in newInput && target.name) newInput.prompt = target.name;
+      }
+      const map = stepSequence(doc).items[index];
+      if (!isMap(map)) throw new Error('当前步骤不是有效的 YAML 对象。');
+      const oldYamlInput = map.get(oldNode, true);
+      let newYamlInput: Node = doc.createNode(typeof replacement[newNode] === 'object' ? newInput : replacement[newNode]);
+      // Both native input metadata and step metadata survive an operation change.
+      if (isMap(oldYamlInput) && oldYamlInput.has('$')) {
+        if (!isMap(newYamlInput)) newYamlInput = doc.createNode({ title: replacement[newNode] });
+        if (isMap(newYamlInput)) newYamlInput.set('$', oldYamlInput.get('$', true)?.clone());
+      }
+      map.set(newNode, newYamlInput);
+      if (newNode !== oldNode) map.delete(oldNode);
     });
   }
   function undo(redo = false) {
@@ -136,6 +163,8 @@ export function WorkflowEditor({ text, onChange, onDebug, onRecord, flows = {}, 
                   <Button type="button" size="icon-sm" variant="ghost" aria-label={`删除步骤 ${index + 1}`} disabled={disabled} onClick={() => edit(doc => { stepSequence(doc).items.splice(index, 1); })}><Trash2 /></Button>
                 </div>
                 <label className="block space-y-1 text-sm"><span>步骤名称</span><Input aria-label={`步骤名称 ${index + 1}`} value={String(objectValue(step.testo).name ?? '')} disabled={disabled} placeholder={titleFor(step)} onChange={event => changeField(index, ['testo', 'name'], event.target.value)} /></label>
+                <label className="block space-y-1 text-sm"><span>操作类型</span><NativeSelect aria-label={`操作类型 ${index + 1}`} value={operationId(step)} disabled={disabled} onChange={event => changeOperation(index, event.target.value)}><OperationOptions />{operation(step) === 'useFlow' && <NativeSelectOption value="useFlow">共享步骤 · useFlow</NativeSelectOption>}{!operationCatalog.some(item => item.id === operationId(step)) && operation(step) !== 'useFlow' && <NativeSelectOption value={operationId(step)}>{operationId(step)}（自定义节点）</NativeSelectOption>}</NativeSelect><span className="block text-xs text-muted-foreground">切换操作会重置不适用的参数；可以撤销恢复。</span></label>
+                {operationCatalog.find(item => item.id === operationId(step))?.group === 'Playwright' && operation(step) !== 'gotoUrl' && <p className="text-xs text-muted-foreground">此操作需要独立浏览器，Chrome Bridge 不支持此操作。</p>}
                 <StepFields step={step} index={index} flows={flows} disabled={disabled} change={(path, value) => changeField(index, path, value)} />
                 <details><summary className="cursor-pointer text-xs text-muted-foreground">高级步骤 YAML（保留原生参数和 $ 设置）</summary><StepYaml value={stringify(step)} disabled={disabled} apply={value => edit(doc => { const replacement = parseDocument(value); if (replacement.errors.length || !isMap(replacement.contents)) throw new Error('请填写有效的单个步骤 YAML。'); stepSequence(doc).items[index] = replacement.contents.clone(); })} /></details>
                 {phase === 'steps' && (onDebug || onRecord) && <div className="flex flex-wrap gap-2 border-t pt-3">
@@ -147,8 +176,8 @@ export function WorkflowEditor({ text, onChange, onDebug, onRecord, flows = {}, 
             {!steps.length && <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">此阶段还没有步骤，可以在下方添加。</p>}
           </div>
           <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 p-3">
-            <NativeSelect aria-label="新增步骤类型" value={newNode} disabled={disabled} onChange={event => setNewNode(event.target.value)}>{Object.keys(defaults).map(name => <NativeSelectOption key={name} value={name}>{rawNames[name] ?? nodeNames[name]}</NativeSelectOption>)}{Object.keys(flows).map(id => <NativeSelectOption key={id} value={`flow:${id}`}>共享步骤：{flows[id]!.name}</NativeSelectOption>)}</NativeSelect>
-            <Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => add([newNode.startsWith('flow:') ? { useFlow: { id: newNode.slice(5) } } : structuredClone(defaults[newNode]!)])}><Plus />添加步骤</Button>
+            <NativeSelect aria-label="新增步骤类型" value={newNode} disabled={disabled} onChange={event => setNewNode(event.target.value)}><OperationOptions />{Object.keys(flows).map(id => <NativeSelectOption key={id} value={`flow:${id}`}>共享步骤：{flows[id]!.name}</NativeSelectOption>)}</NativeSelect>
+            <Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => add([newNode.startsWith('flow:') ? { useFlow: { id: newNode.slice(5) } } : createOperationStep(newNode)])}><Plus />添加步骤</Button>
             {phase === 'steps' && onRecord && <Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => onRecord(steps.length, 0)}>在末尾录制</Button>}
           </div>
           <div className="space-y-3 rounded-md border p-4">
@@ -176,10 +205,10 @@ function StepYaml({ value, apply, disabled }: { value: string; apply(value: stri
 function StepFields({ step, index, change, flows, disabled }: { step: Record<string, unknown>; index: number; change(path: (string | number)[], value: unknown): void; flows: SharedFlows; disabled: boolean }) {
   const node = operation(step), input = step[node], data = objectValue(input);
   const scalar = typeof input === 'string';
-  const field = (label: string, path: (string | number)[], value: unknown, options: { multiline?: boolean; number?: boolean; placeholder?: string } = {}) => {
+  const field = (label: string, path: (string | number)[], value: unknown, options: { multiline?: boolean; number?: boolean; placeholder?: string; optional?: boolean } = {}) => {
     const props = { 'aria-label': `${label} ${index + 1}`, value: value === undefined ? '' : String(value), disabled, placeholder: options.placeholder, onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
       const text = event.target.value;
-      change(path, options.number && text !== '' && Number.isFinite(Number(text)) ? Number(text) : text);
+      change(path, options.optional && text === '' ? undefined : options.number && text !== '' && Number.isFinite(Number(text)) ? Number(text) : text);
     } };
     return <label key={path.join('.')} className="block space-y-1 text-sm"><span>{label}</span>{options.multiline ? <Textarea {...props} /> : <Input {...props} inputMode={options.number ? 'numeric' : undefined} />}</label>;
   };
@@ -192,16 +221,20 @@ function StepFields({ step, index, change, flows, disabled }: { step: Record<str
       {action === 'KeyboardPress' && field('按键', [node, 'payload', 'keyName'], payload.keyName, { placeholder: 'Enter / Control+A' })}
       {action === 'Scroll' && <div className="grid grid-cols-2 gap-3">{select('滚动方向', [node, 'payload', 'direction'], payload.direction, [['down', '向下'], ['up', '向上'], ['left', '向左'], ['right', '向右']])}{field('滚动距离', [node, 'payload', 'distance'], payload.distance, { number: true })}</div>}
       {action === 'DragAndDrop' && <div className="grid grid-cols-2 gap-3">{field('终点 X', [node, 'payload', 'endX'], payload.endX, { number: true })}{field('终点 Y', [node, 'payload', 'endY'], payload.endY, { number: true })}</div>}
+      <details open={data.target !== undefined}><summary className="cursor-pointer text-xs text-muted-foreground">录制目标校验</summary><p className="my-2 text-xs text-muted-foreground">执行器会校验坐标处的元素。若要按文本或角色重新定位，请切换操作类型。</p><div className="grid grid-cols-2 gap-3">{(['name', 'role', 'testId', 'tag'] as const).map(key => field(({ name: '目标名称', role: '目标角色', testId: '目标测试标识', tag: '目标标签' })[key], [node, 'target', key], objectValue(data.target)[key], { optional: true }))}</div></details>
       {data.viewport !== undefined && <details><summary className="text-xs text-muted-foreground">录制视口</summary><div className="mt-2 grid grid-cols-2 gap-3">{field('视口宽度', [node, 'viewport', 'width'], objectValue(data.viewport).width, { number: true })}{field('视口高度', [node, 'viewport', 'height'], objectValue(data.viewport).height, { number: true })}</div></details>}
     </div>;
   }
-  if (['aiAct', 'aiTap', 'aiAssert', 'aiWaitFor', 'aiInput', 'aiKeyboardPress', 'aiScroll'].includes(node)) return <div className="space-y-3">
-    {field(node === 'aiWaitFor' ? '等待条件' : node === 'aiAssert' ? '检查条件' : '目标或操作描述', scalar ? [node] : [node, 'prompt'], scalar ? input : data.prompt, { multiline: true, placeholder: '使用页面可见的名称、位置和状态描述目标。支持 ${变量名}。' })}
-    {node === 'aiInput' && field('输入内容', [node, 'value'], data.value, { multiline: true })}
-    {node === 'aiKeyboardPress' && field('按键', [node, 'keyName'], data.keyName)}
-    {node === 'aiScroll' && select('滚动方向', [node, 'direction'], data.direction, [['down', '向下'], ['up', '向上'], ['left', '向左'], ['right', '向右']])}
-    {node === 'aiWaitFor' && <div className="grid grid-cols-2 gap-3">{field('最长等待（毫秒）', [node, 'timeoutMs'], data.timeoutMs, { number: true })}{field('检查间隔（毫秒）', [node, 'checkIntervalMs'], data.checkIntervalMs, { number: true, placeholder: '默认 3000' })}</div>}
-  </div>;
+  const definition = operationCatalog.find(item => item.id === node);
+  if (definition?.fields) return <div className="space-y-3">{definition.fields.map(item => {
+    const scalarKey = node === 'aiKeyboardPress' ? 'keyName' : definition.fields?.[0]?.key;
+    const current = scalar && item.key === scalarKey ? input : data[item.key];
+    const path = scalar && item.key === scalarKey ? [node] : [node, item.key];
+    if (current !== null && typeof current === 'object') return <p key={item.key} className="text-xs text-muted-foreground">{item.label}包含结构化参数，请在高级步骤 YAML 中编辑。</p>;
+    if (item.kind === 'boolean') return <label key={item.key} className="flex items-center gap-2 text-sm"><Checkbox aria-label={`${item.label} ${index + 1}`} checked={current !== false} disabled={disabled} onCheckedChange={checked => change(path, checked === true)} />{item.label}</label>;
+    if (item.choices) return select(item.label, path, current, item.choices);
+    return field(node === 'aiAssert' && item.key === 'prompt' ? '检查条件' : item.label, path, current, { multiline: item.kind === 'multiline', number: item.kind === 'number', optional: item.optional, placeholder: item.optional ? '可选，留空使用默认值' : '支持 ${变量名}' });
+  })}</div>;
   if (node === 'gotoUrl') return field('页面地址', scalar ? [node] : [node, 'url'], scalar ? input : data.url, { placeholder: '${baseUrl}' });
   if (node === 'assertText') return <div className="space-y-3">{field('预期文本', scalar ? [node] : [node, 'text'], scalar ? input : data.text, { multiline: true })}{field('最长等待（毫秒）', [node, 'timeoutMs'], data.timeoutMs, { number: true })}</div>;
   if (node === 'recordToReport') return field('截图说明', scalar ? [node] : [node, 'title'], scalar ? input : data.title);

@@ -7,10 +7,13 @@ import { BrowserProfileService } from './browser-profiles.js';
 import { exportRunBundle } from '../runner/report-bundle.js';
 import { UpdateService } from './updates.js';
 import { WorkspaceStore } from './workspace.js';
+import { createImportHandlers } from './import-handlers.js';
+import { importedWorkflowStatus, importedPreconditions, assertImportedRun, recordImportedValidation } from './import-validation.js';
 import { RecordingService } from './recording.js';
 import { captureChromeSession, type ChromeTarget } from '../recording/chrome-bridge.js';
 import { buildRecordedWorkflow, mergeRecordedWorkflow } from '../recording/workflow.js';
 import { parse, stringify } from 'yaml';
+import { z } from 'zod/v4';
 import { parseWorkflow, validateVariables } from '../shared/workflow-document.js';
 import { assertWorkflowModel, validateWorkflow } from './workflow-validation.js';
 import { retryItems } from './batch-retry.js';
@@ -140,6 +143,7 @@ function prepareRun(i: RunInput, project = store.project(i.projectId), snapshot 
     text = stringify(document);
   }
   const validation = validateWorkflow(text, { defaults: snapshot.defaults, variables: snapshot.variables, flows: snapshot.flows, datasetId: i.datasetId, debug: i.debug }, false, i.browserMode === 'bridge');
+  assertImportedRun(file, sourceText, snapshot, i.datasetId, i.browserMode ?? 'isolated', true);
   return { project, item, file, text, sourceText, environment, revision: workflowHash(sourceText), input: i, snapshot, validation };
 }
 function targetFor(i: RunInput, baseUrl: string): ChromeTarget | undefined {
@@ -166,6 +170,10 @@ function launchRun(plan: ReturnType<typeof prepareRun>, chromeTarget?: ChromeTar
   writeFileSync(path.join(dataDir, 'artifacts', run.runId, 'configuration.json'), JSON.stringify(snapshot, null, 2), { mode: 0o600 });
   void run.result.then(result => {
     record.status = result.status; record.result = result;
+    if (!plan.input.debug) {
+      try { recordImportedValidation(file, plan.sourceText, snapshot, run.runId, result.status === 'passed', plan.input.datasetId, plan.input.browserMode ?? 'isolated'); }
+      catch { record.events.push({ type: 'diagnostic', kind: 'capability', message: '生成用例的验证记录未能更新，请检查项目文件后重新试跑', at: new Date().toISOString() }); }
+    }
     history.save(record); if (active === run) active = undefined; publishRun(record); change();
   });
   return run;
@@ -182,6 +190,7 @@ async function startBatch(i: BatchInput, project: Project, groupPlan?: ReturnTyp
   for (const [key, value] of Object.entries({ MIDSCENE_MODEL_NAME: snapshot.model.name, MIDSCENE_MODEL_BASE_URL: snapshot.model.baseUrl, MIDSCENE_MODEL_FAMILY: snapshot.model.family })) if (value) executionEnvironment[key] = value;
   const plans = i.items.map((entry, index) => {
     const plan = prepareRun({ ...entry, ...i, caseId: entry.caseId, workflowId: entry.workflowId, datasetId: entry.datasetId, browserMode: 'bridge' }, project, snapshot, retry?.items[index]?.definition);
+    assertImportedRun(plan.file, plan.sourceText, snapshot, entry.datasetId, 'bridge', i.allowUnverifiedGenerated === true);
     assertWorkflowModel(plan.validation, snapshot.model.name);
     const session = sessions.get(entry.sessionId);
     targetFor({ ...plan.input, sessionId: entry.sessionId }, snapshot.baseUrl);
@@ -209,7 +218,20 @@ function recordingDefinition(input: Parameters<typeof buildRecordedWorkflow>[0] 
   return draft.replace ? mergeRecordedWorkflow(draft.replace.originalText, text, draft.replace.start, draft.replace.deleteCount) : text;
 }
 
+const documentImports = createImportHandlers(store, modelEnvironment, async () => {
+  const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: [{ name: '测试文档', extensions: ['md', 'xmind'] }] });
+  return result.canceled ? undefined : result.filePaths[0];
+});
 const handlers: Record<string, (input: any) => unknown> = {
+  ...documentImports.handlers,
+  importValidation: (input: unknown) => {
+    const id = z.string().min(1).max(100);
+    const i = z.object({ projectId: id, caseId: id, workflowId: id, environmentId: id, variables: z.unknown().optional(), datasetId: id.optional(), browserMode: z.enum(['isolated', 'bridge']).optional(), loginCondition: z.string().max(2000).optional(), timeoutMs: z.number().int().min(1000).max(86400000).optional() }).strict().parse(input);
+    const settings = { ...i, variables: validateVariables(i.variables ?? {}) };
+    const project = store.project(i.projectId), file = store.workflow(i.projectId, i.caseId, i.workflowId);
+    const location = store.workflowLocation(i.projectId, i.caseId, i.workflowId).file;
+    return { ...importedWorkflowStatus(location, file.text, configurationSnapshot(project, i.environmentId, settings), i.datasetId, i.browserMode ?? 'isolated'), preconditions: importedPreconditions(location) };
+  },
   appInfo: () => ({ dataDirectory: dataDir, update: updates.state() }),
   checkUpdate: () => updates.check(),
   downloadUpdate: () => updates.download(),
@@ -232,6 +254,8 @@ const handlers: Record<string, (input: any) => unknown> = {
       checks.push({ name: 'Workflow', status: 'passed', message: `${plan.validation.steps} 个步骤，变量和共享步骤校验通过` });
       checks.push({ name: '运行环境', status: 'passed', message: plan.snapshot.baseUrl });
       checks.push({ name: '运行目标', status: 'passed', message: target ? `Profile ${target.profile?.connectorId ?? 'Midscene'} · 标签页 ${target.tabId}` : '独立浏览器会话' });
+      const generated = importedWorkflowStatus(plan.file, plan.sourceText, plan.snapshot, i.datasetId, i.browserMode ?? 'isolated');
+      if (generated.imported) checks.push({ name: '生成用例验证', status: generated.status === 'passed' ? 'passed' : 'info', message: generated.status === 'passed' ? '当前 Workflow 和配置已通过试跑' : '待验证或上次试跑失败；此次启动会真实操作页面进行验证' });
       const needsModel = plan.validation.needsModel;
       const modelName = plan.snapshot.model.name.trim();
       checks.push({ name: '模型', status: needsModel && !modelName ? 'failed' : 'info', message: needsModel ? (modelName ? `使用 ${modelName}；实际模型调用在执行时验证` : '请先配置模型名称') : '本次没有 AI 步骤' });
@@ -244,7 +268,7 @@ const handlers: Record<string, (input: any) => unknown> = {
     if (!source.snapshot || !source.environmentId) throw new Error('旧批次没有完整配置快照，请配置新批次');
     const items = retryItems(source, i.mode), project = store.project(source.projectId);
     if (items.some(item => !item.definition)) throw new Error('原批次缺少用例快照，请配置新批次');
-    return startBatch({ projectId: source.projectId, environmentId: source.environmentId, failurePolicy: source.failurePolicy, dependent: source.dependent, variables: i.variables ?? source.snapshot.variables,
+    return startBatch({ projectId: source.projectId, environmentId: source.environmentId, failurePolicy: source.failurePolicy, dependent: source.dependent, allowUnverifiedGenerated: i.allowUnverifiedGenerated, variables: i.variables ?? source.snapshot.variables,
       items: items.map(item => ({ caseId: item.caseId, workflowId: item.workflowId, datasetId: item.datasetId, sessionId: i.sessionId })) }, project, undefined, { source, mode: i.mode, items });
   },
   createProject: (i) => store.create(i.name, i.description ?? ''),
@@ -470,7 +494,7 @@ ipcMain.handle('workspace:call', async (event, name: string, input: unknown) => 
   if (event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame || !Object.hasOwn(handlers, name)) return { ok: false, error: '不允许的操作' };
   try {
     const value = await handlers[name]!(input);
-    if (!['appInfo', 'state', 'history', 'runDetail', 'gitStatus', 'preflight', 'runPlan', 'runScreenshot', 'browserProfiles', 'copyBrowserPairingCode', 'openBrowserConnector', 'workflow', 'importFile', 'exportRun', 'openReport', 'recordingFrame', 'recordingScreenshot', 'buildRecording'].includes(name)) change();
+    if (!['knowledge', 'listImportDrafts', 'loadImportDraft', 'parseImportDocument', 'pickImportDocument', 'compileImportCases', 'importValidation', 'appInfo', 'state', 'history', 'runDetail', 'gitStatus', 'preflight', 'runPlan', 'runScreenshot', 'browserProfiles', 'copyBrowserPairingCode', 'openBrowserConnector', 'workflow', 'importFile', 'exportRun', 'openReport', 'recordingFrame', 'recordingScreenshot', 'buildRecording'].includes(name)) change();
     return { ok: true, value };
   } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
 });
@@ -487,7 +511,7 @@ function createWindow(): void {
 }
 app.on('before-quit', (event) => {
   if (!quitting) {
-    event.preventDefault(); quitting = true;
+    event.preventDefault(); quitting = true; documentImports.cancelAll();
     if (batchQueue.active) batchQueue.cancel(batchQueue.active.id);
     active?.cancel(); void Promise.allSettled([browserProfiles.destroy(), connectionResult, batchQueue.result, active?.result, recorder.shutdown()]).finally(() => app.quit());
   }

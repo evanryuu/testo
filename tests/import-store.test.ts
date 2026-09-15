@@ -1,0 +1,183 @@
+import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
+import { caseSpecSchema } from '../src/shared/case-spec.js';
+import type { CaseSpec, ImportDraft } from '../src/shared/case-spec.js';
+import { ImportStore } from '../src/main/import-store.js';
+import { WorkspaceStore } from '../src/main/workspace.js';
+import { splitCaseSpec } from '../src/shared/case-spec-edit.js';
+import { compileCaseSpec } from '../src/import/compiler.js';
+
+function setup(t: { after(fn: () => void): void }) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'import-store-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const store = new WorkspaceStore(path.join(dir, 'data'), path.join(dir, 'projects'));
+  const projectId = store.create('Import tests', ''), project = store.project(projectId);
+  const imports = new ImportStore(store), documentId = 'doc-1';
+  const spec: CaseSpec = caseSpecSchema.parse({ id: 'case-spec-1', sourceId: 'TC-001', title: 'Open agents', description: 'Agent listing', path: ['Agents'], priority: 'P1', tags: [], origin: 'source', ref: { documentId, line: 1 }, preconditions: [], data: [], steps: [{ id: 'step-1', text: 'Open the agents page', kind: 'action', origin: 'source', ref: { documentId, line: 2 } }], expectations: [{ id: 'expect-1', text: 'Agent list is visible', kind: 'text', origin: 'source', ref: { documentId, line: 3 } }], questions: [] });
+  const workflow = 'cases:\n  - name: Open agents\n    steps:\n      - gotoUrl: "${baseUrl}/agents"\n';
+  const draft: ImportDraft = { id: randomUUID(), document: { id: documentId, name: 'cases.md', format: 'markdown', text: '# TC-001 Open agents\nOpen the agents page\nExpected: Agent list is visible', warnings: [] }, mode: 'existing', cases: [spec], selectedIds: [spec.id], workflows: { [spec.id]: { text: workflow, specHash: createHash('sha256').update(JSON.stringify(spec)).digest('hex'), edited: false } }, variables: {}, suiteId: project.suites[0]!.id, saved: {} };
+  return { dir, store, imports, projectId, project, draft, spec };
+}
+test('draft save/read/list roundtrip, revisions, project isolation and malformed JSON protection', t => {
+  const { imports, draft, project, projectId, store } = setup(t);
+  const saved = imports.save(projectId, draft, '');
+  assert.deepEqual(imports.read(projectId, draft.id), saved);
+  assert.deepEqual(imports.list(projectId), [saved]);
+  assert.equal(statSync(path.join(project.root, 'imports', `${draft.id}.json`)).mode & 0o777, 0o600);
+  assert.throws(() => imports.save(projectId, draft, ''), /已被修改/);
+  const secondProject = store.create('Other', '');
+  assert.deepEqual(imports.list(secondProject), []);
+  assert.throws(() => imports.read(secondProject, draft.id), /不存在/);
+  writeFileSync(path.join(project.root, 'imports', `${draft.id}.json`), '{broken');
+  assert.throws(() => imports.save(projectId, draft, saved.revision));
+  assert.equal(readFileSync(path.join(project.root, 'imports', `${draft.id}.json`), 'utf8'), '{broken');
+});
+test('commit writes complete case, workflow and source together with pending validation', t => {
+  const { imports, draft, projectId, store, project } = setup(t);
+  draft.newSuiteName = 'Imported agents';
+  const savedDraft = imports.save(projectId, draft, '');
+  const result = imports.commit(projectId, draft.id, savedDraft.revision, 'skip');
+  assert.equal(result.saved.length, 1);
+  const current = store.project(projectId), item = current.cases[0]!;
+  assert.equal(current.errors.length, 0);
+  assert.equal(current.suites.find(suite => suite.id === item.suiteId)!.name, 'Imported agents');
+  assert.equal(item.workflows[0]!.ready, true);
+  const location = store.caseLocation(projectId, item.id), source = JSON.parse(readFileSync(path.join(path.dirname(location.file), 'source.json'), 'utf8'));
+  assert.deepEqual(source.document, draft.document);
+  assert.deepEqual(source.spec, draft.cases[0]);
+  assert.equal(source.validation, undefined);
+  assert.equal(source.workflowHash, createHash('sha256').update(store.workflow(projectId, item.id, item.workflows[0]!.id).text).digest('hex'));
+  assert.equal(imports.commit(projectId, draft.id, result.snapshot.revision, 'copy').saved.length, 0, 'repeat commit does not duplicate its own saved entries');
+  assert.equal(readdirSync(path.join(project.root, 'imports')).some(name => name.startsWith('.transaction-')), false);
+});
+test('duplicate skip detects equivalent content and source IDs; copy only creates new cases', t => {
+  const { imports, draft, projectId, store } = setup(t);
+  let snapshot = imports.save(projectId, draft, '');
+  imports.commit(projectId, draft.id, snapshot.revision, 'skip');
+  const another = structuredClone(draft); another.id = randomUUID(); another.document.id = 'doc-2';
+  for (const spec of another.cases) for (const ref of [spec.ref, ...spec.steps.map(item => item.ref), ...spec.expectations.map(item => item.ref)]) ref.documentId = another.document.id;
+  another.workflows[another.cases[0]!.id]!.specHash = createHash('sha256').update(JSON.stringify(another.cases[0])).digest('hex');
+  snapshot = imports.save(projectId, another, '');
+  const skipped = imports.commit(projectId, another.id, snapshot.revision, 'skip');
+  assert.deepEqual(skipped.skipped, another.selectedIds);
+  assert.equal(store.project(projectId).cases.length, 1);
+  const copied = imports.commit(projectId, another.id, snapshot.revision, 'copy');
+  assert.equal(copied.saved.length, 1);
+  assert.equal(store.project(projectId).cases.length, 2);
+});
+test('same-batch split fragments keep both assets while content duplicates and later imports still honor skip', t => {
+  const { imports, draft, projectId, store, spec } = setup(t);
+  spec.steps.push({ id: 'step-2', text: 'Open the agent details', kind: 'action', origin: 'source', ref: { documentId: draft.document.id, line: 4 } });
+  spec.expectations[0]!.afterStepId = 'step-1';
+  spec.expectations.push({ id: 'expect-2', text: 'Agent details are visible', kind: 'text', origin: 'source', ref: { documentId: draft.document.id, line: 5 } });
+  const fragments = splitCaseSpec(spec, 1, 'case-spec-2');
+  for (const fragment of fragments) for (const question of fragment.questions) question.resolved = true;
+  const duplicate = structuredClone(fragments[0]); duplicate.id = 'same-content';
+  draft.cases = [...fragments, duplicate]; draft.selectedIds = draft.cases.map(item => item.id);
+  draft.workflows = Object.fromEntries(draft.cases.map(item => {
+    const generated = compileCaseSpec(item);
+    return [item.id, { text: generated.text, specHash: generated.specHash, edited: false }];
+  }));
+  const snapshot = imports.save(projectId, draft, '');
+  const result = imports.commit(projectId, draft.id, snapshot.revision, 'skip');
+  assert.deepEqual(result.saved.map(item => item.specId), fragments.map(item => item.id));
+  assert.deepEqual(result.skipped, ['same-content']);
+  assert.equal(store.project(projectId).cases.length, 2);
+  for (const saved of result.saved) {
+    const location = store.caseLocation(projectId, saved.caseId);
+    const source = JSON.parse(readFileSync(path.join(path.dirname(location.file), 'source.json'), 'utf8'));
+    assert.equal(source.spec.sourceId, 'TC-001', 'both fragments retain the original source case ID');
+    assert.deepEqual(source.spec, fragments.find(item => item.id === saved.specId));
+    assert.deepEqual(source.document, draft.document);
+  }
+  assert.equal(new Set(Object.values(result.snapshot.draft.saved).map(item => item.fingerprint)).size, 2);
+  const later = structuredClone(draft); later.id = randomUUID();
+  later.cases = fragments; later.selectedIds = fragments.map(item => item.id); delete later.workflows['same-content'];
+  const laterSnapshot = imports.save(projectId, later, '');
+  const skipped = imports.commit(projectId, later.id, laterSnapshot.revision, 'skip');
+  assert.deepEqual(skipped.skipped, later.selectedIds); assert.equal(skipped.saved.length, 0);
+  const copied = imports.commit(projectId, later.id, laterSnapshot.revision, 'copy');
+  assert.equal(copied.saved.length, 2); assert.equal(store.project(projectId).cases.length, 4);
+});
+test('drafts without generated workflows create no empty cases or suites', t => {
+  const { imports, draft, projectId, store } = setup(t);
+  draft.workflows = {}; draft.newSuiteName = 'Empty';
+  const saved = imports.save(projectId, draft, '');
+  assert.equal(imports.commit(projectId, draft.id, saved.revision, 'skip').saved.length, 0);
+  assert.equal(store.project(projectId).cases.length, 0);
+  assert.equal(store.project(projectId).suites.length, 1);
+});
+test('commit rejects invalid or stale workflows before publishing any case', t => {
+  const { imports, draft, projectId, store } = setup(t);
+  draft.workflows[draft.cases[0]!.id]!.text = 'cases: [{name: broken, steps: [{unknownNode: nope}]}]';
+  let saved = imports.save(projectId, draft, '');
+  assert.throws(() => imports.commit(projectId, draft.id, saved.revision, 'skip'));
+  assert.equal(store.project(projectId).cases.length, 0);
+  draft.cases[0]!.title = 'Changed';
+  saved = imports.save(projectId, draft, saved.revision);
+  assert.throws(() => imports.commit(projectId, draft.id, saved.revision, 'skip'), /重新生成/);
+  assert.equal(store.project(projectId).cases.length, 0);
+});
+test('save rejects unknown fields, cross-document references, forged saved entries and explicit credentials', t => {
+  const { imports, draft, projectId } = setup(t);
+  assert.throws(() => imports.save(projectId, { ...draft, extra: true } as ImportDraft, ''), /格式无效/);
+  const wrong = structuredClone(draft); wrong.cases[0]!.ref.documentId = 'other';
+  assert.throws(() => imports.save(projectId, wrong, ''), /不属于/);
+  for (const text of ['password: secret123', 'token = abc123', 'Authorization: Bearer abcdefghijklmnop']) assert.throws(() => imports.save(projectId, { ...draft, document: { ...draft.document, text } }, ''), /凭据|密码|Token/);
+  const forged = structuredClone(draft); forged.saved[forged.cases[0]!.id] = { caseId: randomUUID(), workflowId: randomUUID(), fingerprint: 'a'.repeat(64) };
+  assert.throws(() => imports.save(projectId, forged, ''), /不能由编辑器修改/);
+  assert.doesNotThrow(() => imports.save(projectId, { ...draft, document: { ...draft.document, text: 'password: ${PASSWORD}' } }, ''));
+});
+test('generation blockers are derived at commit while missing runtime variables can remain pending', t => {
+  const { imports, draft, projectId, store } = setup(t);
+  draft.cases[0]!.expectations = [];
+  draft.workflows[draft.cases[0]!.id]!.specHash = createHash('sha256').update(JSON.stringify(draft.cases[0])).digest('hex');
+  let snapshot = imports.save(projectId, draft, '');
+  assert.throws(() => imports.commit(projectId, draft.id, snapshot.revision, 'skip'), /生成阻断/);
+  assert.equal(store.project(projectId).cases.length, 0);
+  draft.cases[0]!.expectations = [{ id: 'expected', text: '${AGENT_NAME} is visible', kind: 'text', origin: 'manual', ref: { documentId: draft.document.id } }];
+  draft.workflows[draft.cases[0]!.id]!.text = 'cases: [{name: Agents, steps: [{aiAct: "Find ${AGENT_NAME}"}]}]';
+  draft.workflows[draft.cases[0]!.id]!.specHash = createHash('sha256').update(JSON.stringify(caseSpecSchema.parse(draft.cases[0]))).digest('hex');
+  snapshot = imports.save(projectId, draft, snapshot.revision);
+  assert.equal(imports.commit(projectId, draft.id, snapshot.revision, 'skip').saved.length, 1);
+});
+test('existing and dangling import symlinks never escape the project', t => {
+  const { imports, draft, projectId, dir, project } = setup(t);
+  const outside = path.join(dir, 'outside');
+  symlinkSync(outside, path.join(project.root, 'imports'));
+  assert.throws(() => imports.save(projectId, draft, ''), /符号链接/);
+  assert.equal(existsSync(outside), false);
+});
+test('a failed batch rolls back cases, newly created suite and saved draft records', t => {
+  const { store, imports, draft, projectId, project } = setup(t);
+  draft.newSuiteName = 'Rollback';
+  const snapshot = imports.save(projectId, draft, '');
+  const failing = new ImportStore(store, { checkpoint(phase, index) { if (phase === 'write' && index === 1) throw new Error('Injected I/O failure'); } });
+  assert.throws(() => failing.commit(projectId, draft.id, snapshot.revision, 'skip'), /Injected I\/O failure/);
+  assert.equal(store.project(projectId).cases.length, 0);
+  assert.equal(store.project(projectId).suites.length, 1);
+  assert.deepEqual(imports.read(projectId, draft.id), snapshot);
+  assert.equal(readdirSync(path.join(project.root, 'imports')).some(name => name.startsWith('.transaction-')), false);
+});
+test('a real interrupted process leaves a recoverable transaction and next list rolls it back', t => {
+  const { imports, draft, projectId, store, dir, project } = setup(t);
+  draft.newSuiteName = 'Interrupted';
+  const snapshot = imports.save(projectId, draft, '');
+  const workspaceModule = pathToFileURL(path.resolve('dist/src/main/workspace.js')).href;
+  const importModule = pathToFileURL(path.resolve('dist/src/main/import-store.js')).href;
+  const script = `import { WorkspaceStore } from ${JSON.stringify(workspaceModule)}; import { ImportStore } from ${JSON.stringify(importModule)}; const store = new WorkspaceStore(${JSON.stringify(path.join(dir, 'data'))}, ${JSON.stringify(path.join(dir, 'projects'))}); const imports = new ImportStore(store, { checkpoint(phase) { if (phase === 'write') process.exit(77); } }); imports.commit(${JSON.stringify(projectId)}, ${JSON.stringify(draft.id)}, ${JSON.stringify(snapshot.revision)}, 'skip');`;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  assert.equal(child.status, 77, child.stderr);
+  assert.equal(readdirSync(path.join(project.root, 'imports')).some(name => name.startsWith('.transaction-')), true);
+  const restored = imports.list(projectId);
+  assert.match(restored[0]!.draft.document.warnings.join(' '), /恢复中断/);
+  assert.equal(store.project(projectId).cases.length, 0);
+  assert.equal(store.project(projectId).suites.length, 1);
+  assert.deepEqual(imports.read(projectId, draft.id), snapshot);
+});

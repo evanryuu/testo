@@ -267,3 +267,72 @@
 - 最终 Apple Silicon 安装包真实集成测试 1/1 通过（33.5 秒），验证 Testo 标题/侧栏/菜单、创建项目与用例、执行、录制、ZIP 导出、草稿加密和重启恢复。证据 `artifacts/testo-brand-package-test.log`、`artifacts/package-k140UB/packaged-app.png`，已目视确认。
 - 旧安装包在隔离目录生成合成密文，新安装包沿用该目录并成功解密；数据目录、内部名称及包名保持兼容。证据 `artifacts/brand-compat-c3D28p/before.json`、`after.json` 和 `testo-packaged-window.png`。未读取个人凭证。
 - 桌面完整构建、最终主进程编译、安装包构建、`codesign --verify --deep --strict` 及 diff 检查通过。安装包仍为 ad-hoc 签名，没有进行 Apple 公证或创建 GitHub Release。
+
+## 2026-09-15：文档生成、知识库与操作编辑
+
+本轮实际修改与验证包括：Markdown / 基础现代 XMind 导入、CaseSpec 审查与拆分合并、确定性 Workflow 编译、AI 规划入口、项目知识库、草稿恢复与事务保存、版本绑定的验证状态，以及 Midscene / Playwright 操作选择器。本节记录本地验证结果，不代表已经发布或部署。
+
+### 实际运行的检查
+
+```sh
+ALLOW_HEAVY=1 npm run build:runner
+./node_modules/.bin/tsc -p tsconfig.ui.json
+ALLOW_HEAVY=1 ./node_modules/.bin/vite build
+
+ALLOW_HEAVY=1 node --test --test-concurrency=1 \
+  dist/tests/document-import.test.js dist/tests/document-planner.test.js \
+  dist/tests/import-store.test.js dist/tests/import-validation.test.js \
+  dist/tests/import-handlers.test.js dist/tests/case-spec-edit.test.js \
+  dist/tests/knowledge-store.test.js dist/tests/operation-nodes.test.js \
+  dist/tests/workflow-document.test.js dist/tests/recorded-workflow.test.js \
+  dist/tests/batch.test.js dist/tests/workspace.test.js \
+  dist/tests/cli-project.test.js dist/tests/report-bundle.test.js
+
+ALLOW_HEAVY=1 node --test --test-concurrency=1 \
+  dist/tests/document-import-ui.test.js dist/tests/desktop.test.js \
+  dist/tests/batch-ui.test.js
+
+ALLOW_HEAVY=1 node --test --test-concurrency=1 \
+  dist/tests/recording.test.js dist/tests/workflow-editor-ui.test.js \
+  dist/tests/batch-integration.test.js
+
+git diff --check
+```
+
+构建和 TypeScript 检查通过。Vite 仍有主包超过 500 kB 的提示，未把包体积优化扩展为本次改动。仓库没有配置 lint 命令。本次没有重新打包安装包，也没有发布或升级依赖。
+
+### 已用真实进程、文件与浏览器验证
+
+- Electron 界面：创建项目和环境，维护并保存已确认知识；粘贴两条 Markdown 用例，对照来源编辑，排除缺少预期的候选项，保存草稿，关闭应用后恢复。
+- 生成步骤后进行人工修改，重新生成出现明确覆盖确认；只保存勾选项，一个业务 Case 对应一个 Workflow。导入到保存期间受控服务器没有收到页面操作请求。
+- 在真实 Electron 入口上传 XMind 测试夹具，主进程读取真实 ZIP 并保留主题 ID、前置条件、步骤和两条预期；拆分、合并后的草稿可保存。测试只替代操作系统文件选择器返回路径。
+- 通过现有 Midscene Runner 和真实 Chrome 试跑本地按钮页面；点击成功、文本符合预期时通过。受控服务器改为返回错误结果后，点击仍成功而 `assertText` 失败，整体运行正确失败。没有用 mock 的运行结果替代浏览器结果。
+- 生成验证绑定 Workflow 与环境/变量/共享流程/模型/浏览器模式等配置；人工编辑后旧通过记录失效。移除、停用或替换业务断言后，前置检查不能替代业务断言。重复的步骤或预期 ID 也不能绕过检查。
+- 真实临时目录覆盖 revision 冲突、重复跳过/另存、同批拆分、事务异常回滚；真实子进程在提交中断后，重新读取草稿可恢复。覆盖损坏 JSON、现存与悬空符号链接。
+- XMind 夹具测试覆盖层级、顺序、来源、自由脑图边界、旧 XML、损坏压缩包、不安全路径、重复条目、大小与深度限制。不支持内容明确警告。
+- 原有录制→检查→保存→回放、漏点证据和重启恢复、Workflow 编辑、桌面资产/报告/取消，以及第一条真实 Chrome 批次场景通过。桌面/批次界面旧测试已适配本次新增字段和中文操作名称后通过。
+
+界面证据保存在 `artifacts/document-import-ui-*/`，包括 `review.png`、`trial-preview.png`、`passed.png`、`failed.png` 和 `xmind-review.png`；已实际查看 Markdown 和 XMind 界面截图。
+
+### AI 验证的实际边界
+
+- 已验证 Schema 校验、原文来源校验、拒绝越权字段、确认知识的按需选择、只发送选中知识正文、一次纠错重试、取消及超时。
+- 真实 Midscene SDK HTTP 调用链连接的是 **127.0.0.1 的测试模型服务**，并非真实模型。120 秒超时通过 Node MockTimers 快进，确认子进程退出、请求连接关闭且下次可重试。
+- 没有真实模型密钥或授权业务环境，因此尚未验证真实模型的用例设计质量、自由文档理解质量、知识导航效果以及 `aiAct` / `aiAssert` 在真实业务系统中的执行效果。登录样例的源映射、变量识别和节点编译已验证，但没有用真实账号试跑该登录场景。
+- XMind 文件是可复现的现代 JSON/ZIP 测试夹具，未在 XMind 原生应用中打开确认，也不代表所有版本和扩展结构均兼容。
+
+### 尚未通过的既有回归
+
+`desktop connector batches freeze shared inputs and workflows, and retry the intended failed or dependent items` 在整体运行和单独重跑时均失败于 Chrome 配置配对阶段：`浏览器配置配对码不匹配，请重新配对`。单独重跑命令：
+
+```sh
+ALLOW_HEAVY=1 node --test --test-name-pattern='desktop connector batches' dist/tests/batch-integration.test.js
+```
+
+失败发生在 `tests/batch-integration.test.ts` 的 `refreshBrowserProfile`，收到的连接 token 与期望 token 不一致。失败证据中运行数、批次数、页面操作数均为 0；相关浏览器配置与扩展源码没有本次改动。错误 token 的来源尚未确定，因此不能把这条测试算作通过，也不能据此断言本次功能没有任何批次回归。没有改动或停止用户现有 Chrome 会话。
+
+### 最终检查汇总
+
+最终核心检查 **107 项全部通过**，完整输出见 `artifacts/document-import-final-tests.log`。最后一轮文档/桌面/批次界面检查 **3 项全部通过**，输出见 `artifacts/document-import-final-ui.log`。这些计数不把前面重复执行的测试累加，也不包含上面明确失败的 Chrome 扩展批次测试。原有录制与 Workflow 编辑的单独检查结果见本节说明。
+
+试跑确认页补充来源前置条件后，额外运行 `document-import-ui.test.js` 与 `import-validation.test.js`，**12 项全部通过**；日志为 `artifacts/document-import-preview-tests.log`。此轮复验没有替代或掩盖上面的已知批次配对失败。

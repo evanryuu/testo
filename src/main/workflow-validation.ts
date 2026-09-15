@@ -8,6 +8,7 @@ import { PlaywrightAgent } from '@midscene/web/playwright';
 import { createBridgeNodes } from '../runner/bridge-nodes.js';
 import { createWaitNodes } from '../runner/wait-nodes.js';
 import { createRecordedNodes } from '../runner/recorded-nodes.js';
+import { createMidsceneOperationNodes, createPlaywrightOperationNodes, midsceneOperationNames, playwrightOperationNames } from '../runner/operation-nodes.js';
 import { compileWorkflow } from '../shared/workflow-document.js';
 
 export function validateWorkflow(text: string, options: Parameters<typeof compileWorkflow>[1] = {}, editing = false, bridge = false) {
@@ -22,19 +23,24 @@ export function validateWorkflow(text: string, options: Parameters<typeof compil
     writeFileSync(file, compiled.text, { mode: 0o600 });
     const unavailable = (): never => { throw new Error('校验阶段不能操作浏览器'); };
     const midsceneNodes = createMidsceneNodes({ agentClass: PlaywrightAgent, getAgent: unavailable });
-    const modelNodes = new Set(midsceneNodes.filter(node => node.name.startsWith('ai')).map(node => node.name));
+    const modelNodes = new Set([...midsceneNodes.filter(node => node.name.startsWith('ai')).map(node => node.name), ...midsceneOperationNames]);
     modelNodes.add('aiWaitFor');
     const registry = new NodeRegistry([
+      ...createMidsceneOperationNodes(unavailable),
+      ...createPlaywrightOperationNodes(unavailable),
       ...(bridge ? createBridgeNodes(unavailable, 'http://localhost') : createPlaywrightNodes({ getPage: unavailable })),
       ...createRecordedNodes({ getPage: unavailable, getAgent: unavailable }),
       ...createWaitNodes(unavailable),
-      ...midsceneNodes,
+      ...midsceneNodes.filter(node => !midsceneOperationNames.has(node.name)),
     ]);
     const document = collectWorkflowDocument({ projectId: 'validation', sourcePath: file, absolutePath: file }, {
       resolveNode: name => registry.get(name), variables, env: process.env,
     });
     if (document.cases.length !== 1) throw new Error('每个平台 Workflow 必须只包含一个 Case');
     const executableSteps = [...Object.values(document.lifecycle).flat(), ...document.cases.flatMap(item => item.definition.steps)];
+    if (bridge) for (const step of executableSteps) {
+      if (playwrightOperationNames.has(step.node)) throw new Error(`Chrome Bridge 不支持 Playwright 操作 ${step.node}，请使用自动启动的浏览器运行`);
+    }
     const needsModel = executableSteps.some(step => modelNodes.has(step.node));
     // Collection resolves variables and normalizes metadata; input schemas are normally deferred until execution.
     // While editing, unresolved runtime parameters have placeholder values and cannot be checked for type yet.

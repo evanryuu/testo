@@ -153,7 +153,7 @@ test('desktop creates assets, runs real workflows, opens report and restores his
     await page.getByLabel('Workflow YAML', { exact: true }).fill(readFileSync('tests/fixtures/cancelled.yaml', 'utf8'));
     await page.getByRole('button', { name: '保存', exact: true }).click();
     await page.getByRole('button', { name: '运行', exact: true }).click();
-    await page.locator('[data-testid="run-step"] strong').filter({ hasText: /^wait$/ }).waitFor({ timeout: 45_000 });
+    await page.locator('[data-testid="run-step"] strong').filter({ hasText: /^固定等待$/ }).waitFor({ timeout: 45_000 });
     const duplicateError = await page.evaluate(async () => {
       const state = await window.workspace.state();
       const p = state.projects[0]!, c = p.cases[0]!;

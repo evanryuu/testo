@@ -15,6 +15,7 @@ import { captureActionEvidence } from './evidence.js';
 import { describeRunStep } from '../shared/run-steps.js';
 import { createWaitNodes } from './wait-nodes.js';
 import { createRecordedNodes } from './recorded-nodes.js';
+import { createMidsceneOperationNodes, createPlaywrightOperationNodes, midsceneOperationNames, playwrightOperationNames, operationStepTimeoutMs } from './operation-nodes.js';
 import { RECORDING_VIEWPORT } from '../recording/workflow.js';
 import type { RunOptions, WorkerEvent, WaitMetric } from './messages.js';
 
@@ -81,6 +82,8 @@ export async function executeWorkflow(
       return agent;
     };
     const registry = new NodeRegistry([
+      ...createMidsceneOperationNodes(ctx => getAgent(ctx.scope === 'case' ? ctx.case.runId : ctx.document.documentRunId)),
+      ...createPlaywrightOperationNodes(getPage),
       ...createWaitNodes(ctx => getAgent(ctx.scope === 'case' ? ctx.case.runId : ctx.document.documentRunId), { ...(options.chromeTarget ? {} : { getPage }), onProgress: event => {
         const metric = compiled.stepMetadata[`${event.phase}:${event.index}`]?.metric;
         emit({ ...event, ...(metric ? { metric } : {}) });
@@ -104,7 +107,7 @@ export async function executeWorkflow(
           getAgent,
           releaseAgent: options.chromeTarget ? undefined : releaseAgent,
         },
-      }),
+      }).filter(node => !midsceneOperationNames.has(node.name)),
     ]);
     // Collect only the selected immutable snapshot, never surrounding case metadata.
     const document = collectWorkflowDocument({
@@ -122,6 +125,9 @@ export async function executeWorkflow(
     // Keep explicit per-step limits; otherwise allow navigation to report its own
     // timeout and finish cleanup before the workflow deadline fires.
     for (const step of [...Object.values(document.lifecycle).flat(), ...document.cases.flatMap(item => item.definition.steps)]) {
+      if (options.chromeTarget && playwrightOperationNames.has(step.node)) throw new Error(`Chrome Bridge 不支持 Playwright 操作 ${step.node}，请使用自动启动的浏览器运行`);
+      const operationTimeout = operationStepTimeoutMs(step.node, step.input);
+      if (operationTimeout !== undefined && step.meta.timeoutMs === undefined) step.meta.timeoutMs = operationTimeout;
       if (['aiWaitFor', 'waitForElement'].includes(step.node) && step.meta.timeoutMs === undefined) step.meta.timeoutMs = (typeof step.input.timeoutMs === 'number' ? step.input.timeoutMs : 60000) + 1000;
       if (step.node === 'wait' && step.meta.timeoutMs === undefined) {
         const input = nativeWaitSchema.parse(step.input);

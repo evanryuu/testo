@@ -133,7 +133,7 @@ test('batch UI selects explicit Chrome profile tabs, retries pairing, preserves 
     await expect(page.getByTestId('batch-result-item').first()).toContainText('运行中');
     await expect(page.getByTestId('batch-result-item').nth(1)).toContainText('排队中');
     const calls: any[] = await app.evaluate(() => (globalThis as any).batchCalls);
-    assert.deepEqual(calls.find(call => call.method === 'runBatch').input, { projectId: 'p', environmentId: 'env', failurePolicy: 'continue', variables: { knowledgeBaseName: 'UI shared knowledge base' }, loginCondition: '用户已经登录', dependent: true, timeoutMs: 45000, items: [
+    assert.deepEqual(calls.find(call => call.method === 'runBatch').input, { projectId: 'p', environmentId: 'env', failurePolicy: 'continue', variables: { knowledgeBaseName: 'UI shared knowledge base' }, loginCondition: '用户已经登录', dependent: true, allowUnverifiedGenerated: false, timeoutMs: 45000, items: [
       { caseId: 'check', workflowId: 'check-w', sessionId: 's1', datasetId: 'smoke' }, { caseId: 'send', workflowId: 'send-w', sessionId: 's2', datasetId: undefined },
     ] });
     assert.equal(calls.filter(call => call.method === 'captureSession').length, 0);

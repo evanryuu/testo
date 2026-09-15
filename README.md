@@ -267,10 +267,9 @@ npm run test:recording
 | 状态 | 能力 |
 | --- | --- |
 | 界面已接入 | Web 官方录制预览；点击、输入、键盘、滚动、拖动、导航；原始操作或 AI 操作回放；文本断言、AI 断言、条件等待；截图、报告、历史；Chrome 会话复用 |
-| 可视化新增 | aiTap、固定时长 wait、waitForElement，以及上方列出的录制、等待与断言步骤 |
-| YAML 导入后可编辑参数 | aiBoolean、aiNumber、aiString、aiAsk；复杂参数使用 JSON |
-| 仅独立浏览器 YAML | setCookies、clearCookies、setViewportSize；Chrome Bridge 不支持这些节点 |
-| 未作为独立 YAML 节点接入 | aiInput、aiKeyboardPress、aiScroll、aiQuery、aiLocate 等 API；其中输入、键盘和滚动仍可通过原始录制或 aiAct 执行 |
+| Midscene 操作选择 | aiAct、aiTap、aiHover、aiDoubleClick、aiRightClick、aiInput、aiClearInput、aiKeyboardPress、aiScroll、aiLocate、aiQuery、aiBoolean、aiNumber、aiString、aiAsk、aiAssert、aiWaitFor、recordToReport |
+| Playwright 操作选择 | gotoUrl；click_by_text、click_by_role、click_by_test_id；按 selector 点击、双击、右键点击、填写、按键、悬停、勾选、取消勾选、选择选项、拖拽；reload、goBack、goForward；setCookies、clearCookies、setViewportSize。除 gotoUrl 外，这些操作需要独立浏览器 |
+| 工作流操作选择 | 五种 recordedAction、wait、waitForElement、assertText、requireViewport、项目共享步骤 |
 | 未接入 | Android / iOS 的录制和执行，目前只保存 Workflow；高级 agent 任务缺少 agentExecutor |
 
 这是一份代码接入清单，不代表每个只通过 YAML 暴露的节点都完成了真实模型验证。运行前会按所选浏览器模式检查节点、参数、共享步骤和变量，Chrome Bridge 不支持的 Cookie/视口节点会提前报错。高级 agent 任务仍缺少执行器，不能作为已支持能力使用。
@@ -279,6 +278,12 @@ npm run test:recording
 ## 可视化编辑、参数与共享步骤
 
 Workflow 编辑器直接读写原 YAML，保留注释和未知字段。每一步可以改名称和参数、复制、调整顺序或停用；前置与清理步骤在 `beforeAll`、`beforeEach`、`afterEach`、`afterAll` 中配置。保存时检查文件版本，外部文件变化会提示重新加载，防止覆盖。
+
+“新增步骤类型”和每一步的“操作类型”按 Midscene、Playwright、录制操作、工作流分组。切换操作会重置不适用的参数，保留步骤名称、启用状态与原生 `$` 执行设置；撤销可以恢复整个原步骤。普通字段直接编辑，图片提示、结构化数据要求和其他复杂参数通过高级步骤 YAML 编辑。
+
+`recordedAction` 可以编辑坐标、输入内容、按键、滚动和拖拽参数，以及录制目标的名称、角色、测试标识、标签。目标字段用于校验坐标处的元素；需要重新定位时，可以将步骤切换为 `click_by_text`、`click_by_role` 或 `click_by_test_id`，对应目标字段会自动带入。
+
+例如按文本点击：`click_by_text: { text: 提交, exact: true, timeoutMs: 10000 }`。定位操作使用真实 [Playwright Locator](https://playwright.dev/docs/locators)，自动等待元素可操作，匹配多个元素时报告错误。新增 Playwright 操作的等待上限默认 10 秒，允许设置为 1–25000 毫秒；Chrome Bridge 会在执行前拒绝这些操作。新增 Midscene 节点调用当前 SDK 的对应方法，参数转发有测试覆盖，实际模型识别效果需要使用项目模型配置验证。
 
 - “运行到此步”从头执行到所选步骤，仍执行清理步骤。
 - “单步调试”需要填写当前页面前置条件，先等待该条件成立再执行所选步骤；不会自动重放之前的前置操作。
@@ -383,3 +388,63 @@ npm run run:workflow -- --workflow ./web.yaml --base-url https://example.com --c
 ```
 
 报告导出生成 ZIP。解压后打开 `index.html`，即可查看原生 Midscene HTML 报告、执行截图、事件、定义和配置，无需安装 Midscene。报告包不包含应用凭证文件、Chrome 配对、`.env` 和原始进程日志；明确的配置凭证字段会被隐藏。原生报告和截图仍包含测试页面内容，导出包也不包含所有相对引用文件，因此它是可分享的运行证据，不保证仅凭报告包就能重新执行。
+
+## 从 Markdown / XMind 生成测试用例
+
+在项目的 **Test Cases → 从文档生成** 中，可以不经过录制创建 Web 用例。界面分为导入、审查、生成与保存三个工作区。录制仍可用于后续补充和修正。
+
+1. 选择已有 Suite 或新建 Suite，粘贴 Markdown，或上传 `.md` / `.xmind`。
+2. 默认「导入已有测试用例」：符合模板的内容在本地确定性解析，不调用模型。自由文本点击「AI 识别自由格式」；只有需求或测试点时选择「根据需求 / 测试点设计用例」，再点击 AI 设计。
+3. 对照左侧原文行号 / XMind 节点审查候选用例。可以勾选、编辑、调整步骤、从中间拆分、合并或删除候选项。拆分和合并后必须审核准备条件与断言时机。AI 建议、原文和人工修改分别标记。
+4. 在公共变量区统一补充非敏感输入。缺少预期、步骤或共享流程会阻止生成；缺少运行变量或未完成的人工准备会阻止试跑。缺少信息的内容仍可保存为导入草稿。
+5. 生成所选 Workflow，使用现有可视化步骤编辑器或 YAML 继续修改。重新生成已有 Workflow 前需要明确确认覆盖。每条业务用例独立保存一个 Case 和 Web Workflow。
+6. 点击「保存选中测试资产」。疑似重复可以跳过或另存，不覆盖已有资产。已保存草稿可在该入口恢复；退出前请点击「保存导入草稿」。生成或 AI 识别成功后也会保存草稿。
+7. 点击「配置选中用例的试跑」，选择环境、独立浏览器或 Chrome 会话、数据集和运行参数。单例试跑先展示环境、会话、操作与断言，确认后才会真实操作网页；多例沿用现有 Chrome 批量队列，并需明确勾选允许试跑未验证生成用例。
+8. 在结果页查看步骤状态、截图、等待记录、诊断和原生报告。失败不会自动重写或弱化断言。根据失败步骤判断：连接/配置错误先检查环境，准备检查失败先核实前置条件，操作失败核实生成步骤，业务断言失败则结合截图核实生成内容与产品行为，不能仅凭断言失败自动认定产品缺陷。
+
+### 模板与支持范围
+
+- Markdown 模板：[examples/import-template.md](examples/import-template.md)。支持标题层级、`[源用例 ID]`、前置条件、测试数据、有序步骤和预期结果的章节 / 列表结构。保留原文行号及顺序；自由文本交给 AI 提出边界，再由用户审查。
+- 基础 XMind 示例：[login.xmind](tests/fixtures/document-import/login.xmind)，内部结构可查看 [content.json](tests/fixtures/document-import/content.json)。支持现代 ZIP 中的 `content.json`、多画布的文字主题、父子层级、顺序、主题 ID。带步骤章节的主题作为候选用例；自由脑图不会把每个叶子都变成一个用例。
+- XMind 8 / `content.xml`、ZIP64、分卷、加密或损坏文件会明确拒绝。附件、图片、备注、关系线、富文本和扩展内容不会成为自动化步骤，界面显示受影响位置与警告；游离主题保留在树中，并提示人工核对边界。这不是完整脑图编辑器。
+- Markdown 文件上限 1 MB；XMind 压缩文件 5 MB，声明的解压总大小 20 MB，最多 200 个 ZIP 条目、30 层、5000 个主题。实际 `content.json` 解压也有大小与校验和检查，压缩包不会解压到磁盘。
+- AI 规划最多接受 350000 个文档字符；不支持的结构、过长内容、模型错误会明确提示。当前仅生成现有执行器支持的 Web 操作；跨标签页、文件上传、任意脚本不在本次导入范围内。
+
+编译器按步骤生成现有 Midscene 节点。`点击文本“提交”` 可生成 `click_by_text`，`页面显示“完成”` 可生成可见文本断言；语义操作和检查使用 `aiAct` / `aiAssert`，等待使用独立步骤。没有录制证据时不生成坐标或 `recordedAction`。只有唯一匹配的已有共享流程才能被引用。
+
+前置条件会分别处理。例如「未登录，打开登录页」生成未登录检查和打开页面操作，保留相同来源行；无法明确执行或检查的准备需人工确认。页面 / 登录状态准备不能只靠勾选人工完成跳过检查。默认会先导航到目标环境，不会自动套用登录流程。
+
+### AI 与项目知识库
+
+在项目侧栏的「知识库」维护名称、别名、导航方法或业务说明，例如「Agent 列表 → 从首页点击我的 Agent，等待列表标题出现」。内容保存在项目 `knowledge.json`。AI 先读取已确认知识的名称和别名，最多选取 8 条，再读取被选中的正文。规划过程中提出的新知识保存为待确认草稿，不自动变成已验证事实。
+
+规划复用 Model Settings、安全存储和当前安装的 Midscene SDK，以独立子进程调用模型。模型返回 `CaseSpec` JSON，程序校验来源、结构和操作类型后编译 Workflow，不能直接执行模型返回的任意 YAML。无效结构最多纠正一次，整次规划 120 秒超时；支持取消和重试，失败保留当前已编辑草稿。
+
+只有用户点击 AI 识别 / 设计才会发送本次文档、共享流程名称和选中的知识正文；导入、审查、生成及保存都不连接或操作浏览器。请用 `${变量名}` 引用敏感测试数据。导入边界拒绝明确的明文密码、Cookie、Token 和 API Key；不要把真实凭据写进文档或知识库。
+
+### 保存与验证状态
+
+`imports/<草稿 ID>.json` 保存文档、CaseSpec、来源位置、选中项及可编辑 Workflow。每个生成用例目录中的 `source.json` 保存来源映射，`validation.json` 保存运行 ID 和版本/配置摘要。现有严格 Workflow Schema 没有塞入来源字段。
+
+批量保存先校验并暂存全部文件，通过带恢复记录的事务提交；失败撤销本批写入，进程中断后在下次读取导入草稿时恢复。草稿与知识保存使用 revision 检查和原子写入；外部修改不会被静默覆盖。重复导入首版支持跳过或另存，不做三方合并。
+
+| 状态 | 含义 |
+| --- | --- |
+| 待补充 | 缺少信息、运行输入、准备确认或业务断言 |
+| 待验证 | 已生成 / 保存，但当前 Workflow 与配置没有通过完整试跑 |
+| 验证通过 | 当前 Workflow 和执行配置对应的完整运行通过，包括业务断言 |
+| 验证失败 | 对应版本的完整试跑失败；保留原有运行证据 |
+
+现有 `ready` 仍只表示定义文件存在，不表示语法或业务验证通过。Workflow、引用的共享流程、变量、环境、模型、浏览器模式或运行配置变化，会让旧通过记录失效。局部调试不更新完整业务验证。删除或停用来源预期对应的断言会阻止试跑，前置检查不能替代业务断言。
+
+新生成用例加入桌面批量运行前必须已验证，或明确勾选本次允许试跑；项目 CLI 回归拒绝当前配置下未验证的生成用例。已有无生成来源的资产沿用原行为。环境和页面状态仍需每次检查，历史通过不代表以后网页不会变化。
+
+本地验证和未验证范围见 [VERIFICATION.md](VERIFICATION.md)。示例登录规则仅用于解析测试，不代表真实产品要求。
+
+### 关键实现文件
+
+- `src/shared/case-spec.ts`、`case-spec-edit.ts`：统一草稿结构、来源字段，以及保留断言时机的拆分合并。
+- `src/import/markdown.ts`、`xmind.ts`、`compiler.ts`：确定性解析、安全 ZIP 读取、问题检查与 Workflow 编译。
+- `src/generation/planner.ts`、`worker.ts`：知识检索、结构化模型规划、有限重试、取消和超时。
+- `src/main/import-handlers.ts`、`import-store.ts`、`import-validation.ts`、`knowledge.ts`：IPC 校验、草稿与事务保存、验证版本绑定和知识存储。
+- `src/renderer/DocumentImportView.tsx`、`KnowledgeView.tsx`、`ImportedStatus.tsx`：导入审查工作区、项目知识维护及验证状态。`App.tsx`、`BatchView.tsx` 接入已有运行流程。

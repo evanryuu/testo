@@ -2,6 +2,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { assertImportedRun, recordImportedValidation } from '../main/import-validation.js';
 import { WorkspaceStore } from '../main/workspace.js';
 import { expandGroups } from '../main/group-plan.js';
 import { gitInfo } from '../main/git-info.js';
@@ -98,6 +99,7 @@ export function planProjectRun(input: ProjectRunOptions, environment: NodeJS.Pro
       return selected.map(dataset => {
         const runOptions: RunOptions = { workflowPath, workflowText, baseUrl: snapshot.baseUrl, defaults: snapshot.defaults, variables: snapshot.variables, flows: snapshot.flows, datasetId: dataset?.id, artifactRoot: artifactDirectory, channel: options.channel, headless: options.headless ?? true, timeoutMs: options.timeoutMs };
         const validation = validateWorkflow(workflowText, runOptions);
+        assertImportedRun(workflowPath, workflowText, snapshot, dataset?.id, 'isolated');
         assertWorkflowModel(validation, snapshot.model.name);
         return { caseId, caseName: item.name, datasetId: dataset?.id, datasetName: dataset?.name, definitionHash, options: runOptions };
       });
@@ -127,7 +129,9 @@ export async function runProject(input: ProjectRunOptions, options: { signal?: A
     const abort = () => run.cancel();
     options.signal?.addEventListener('abort', abort, { once: true });
     if (options.signal?.aborted) abort();
-    try { record.result = await run.result; record.status = record.result.status; }
+    try { record.result = await run.result; record.status = record.result.status;
+      recordImportedValidation(item.options.workflowPath, item.options.workflowText!, plan.snapshot, run.runId, record.status === 'passed', item.datasetId, 'isolated');
+    }
     finally { options.signal?.removeEventListener('abort', abort); }
     if (record.status === 'cancelled') summary.status = 'cancelled';
     else if (record.status !== 'passed') summary.status = 'failed';

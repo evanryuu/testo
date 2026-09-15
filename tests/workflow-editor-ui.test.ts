@@ -13,7 +13,7 @@ import { parse } from 'yaml';
 test('Workflow editor edits native steps, preserves YAML, manages data and guards single-step debugging', { timeout: 90000 }, async () => {
   mkdirSync('artifacts', { recursive: true });
   const directory = mkdtempSync(path.resolve('artifacts/workflow-editor-ui-'));
-  const workflow = `# retain this workflow comment\ncases:\n  - name: Knowledge base\n    steps:\n      - gotoUrl:\n          url: \${baseUrl}\n      # retain this input comment\n      - recordedAction:\n          actionType: Input\n          payload:\n            value: original\n            mode: replace\n            x: 20\n            y: 30\n          $:\n            timeout: 10000\n      - customNode:\n          nested:\n            keep: true\nafterEach:\n  - recordToReport: done\n`;
+  const workflow = `# retain this workflow comment\ncases:\n  - name: Knowledge base\n    steps:\n      - gotoUrl:\n          url: \${baseUrl}\n      # retain this input comment\n      - recordedAction:\n          actionType: Input\n          target:\n            name: Library name\n            role: textbox\n          payload:\n            value: original\n            mode: replace\n            x: 20\n            y: 30\n          $:\n            timeout: 10000\n      - customNode:\n          nested:\n            keep: true\nafterEach:\n  - recordToReport: done\n`;
   writeFileSync(path.join(directory, 'main.cjs'), `const {app,BrowserWindow}=require('electron');app.whenReady().then(()=>{const win=new BrowserWindow({width:1200,height:800,webPreferences:{contextIsolation:true,sandbox:true}});win.loadFile(${JSON.stringify(path.join(directory, 'index.html'))});});app.on('window-all-closed',()=>app.quit());`);
   const styles = readdirSync(path.resolve('dist-ui/assets')).filter(file => file.endsWith('.css')).map(file => `<link rel="stylesheet" href="${pathToFileURL(path.resolve('dist-ui/assets', file)).href}">`).join('');
   writeFileSync(path.join(directory, 'index.html'), `<html><head>${styles}</head><body><div id="root"></div><script type="module" src="./fixture.js"></script></body></html>`);
@@ -37,6 +37,26 @@ test('Workflow editor edits native steps, preserves YAML, manages data and guard
     assert.deepEqual(document.cases[0].steps[1].recordedAction.$, { timeout: 10000 });
     assert.deepEqual(document.cases[0].steps[2], { customNode: { nested: { keep: true } } });
     assert.match(await source(), /# retain this workflow comment/); assert.match(await source(), /# retain this input comment/);
+
+    await page.getByLabel('目标名称 2', { exact: true }).fill('保存知识库');
+    assert.equal(parse(await source()).cases[0].steps[1].recordedAction.target.name, '保存知识库');
+    await page.getByLabel('操作类型 2', { exact: true }).selectOption('click_by_text');
+    assert.equal(parse(await source()).cases[0].steps[1].click_by_text.text, '保存知识库');
+    assert.deepEqual(parse(await source()).cases[0].steps[1].click_by_text.$, { timeout: 10000 });
+    assert.equal(parse(await source()).cases[0].steps[1].testo.name, '填写知识库名称');
+    assert.equal(parse(await source()).cases[0].steps[1].recordedAction, undefined);
+    await page.getByLabel('目标文本 2', { exact: true }).fill('提交');
+    await page.getByLabel('精确匹配 2', { exact: true }).uncheck();
+    await page.getByLabel('最长等待（毫秒） 2', { exact: true }).fill('4000');
+    assert.deepEqual(parse(await source()).cases[0].steps[1].click_by_text, { text: '提交', exact: false, timeoutMs: 4000, $: { timeout: 10000 } });
+    await page.screenshot({ path: path.join(directory, 'operation-picker.png'), fullPage: true });
+    for (let undo = 0; undo < 4; undo++) await page.getByRole('button', { name: '撤销', exact: true }).click();
+    assert.equal(parse(await source()).cases[0].steps[1].recordedAction.payload.value, '${knowledgeBaseName}');
+    assert.equal(parse(await source()).cases[0].steps[1].recordedAction.target.name, '保存知识库');
+    await page.getByLabel('目标角色 2', { exact: true }).fill('');
+    assert.equal(parse(await source()).cases[0].steps[1].recordedAction.target.role, undefined);
+    await page.getByLabel('目标名称 2', { exact: true }).fill('');
+    assert.equal(parse(await source()).cases[0].steps[1].recordedAction.target, undefined);
 
     await page.getByRole('button', { name: '复制步骤 2', exact: true }).click();
     await expect(page.getByTestId('workflow-step')).toHaveCount(4);
@@ -67,6 +87,40 @@ test('Workflow editor edits native steps, preserves YAML, manages data and guard
     await page.getByLabel('最长等待（毫秒） 4', { exact: true }).fill('20000');
     await expect(page.getByLabel('最长等待（毫秒） 4', { exact: true })).toHaveValue('20000');
     assert.equal(parse(await source()).cases[0].steps[3].aiWaitFor.timeoutMs, 20000);
+
+    const previousSteps = parse(await source()).cases[0].steps.length;
+    for (const [operation, label, content, key] of [
+      ['aiInput', '输入内容', '自动填写', 'value'],
+      ['aiHover', '目标或操作描述', '保存按钮', 'prompt'],
+      ['click_by_role', '元素名称', '确定', 'name'],
+      ['fill', '元素选择器', '[name="email"]', 'selector'],
+    ]) {
+      await page.getByLabel('新增步骤类型', { exact: true }).selectOption(operation!);
+      await page.getByRole('button', { name: '添加步骤', exact: true }).click();
+      const last = page.getByTestId('workflow-step').last();
+      if (!(await last.evaluate(element => (element as HTMLDetailsElement).open))) await last.locator('summary').first().click();
+      const count = previousSteps + 1;
+      await page.getByLabel(`${label} ${count}`, { exact: true }).fill(content!);
+      assert.equal(parse(await source()).cases[0].steps.at(-1)[operation!][key!], content);
+      await page.getByRole('button', { name: `删除步骤 ${count}`, exact: true }).click();
+    }
+
+    const beforeShorthand = await source();
+    await page.getByRole('tab', { name: 'YAML', exact: true }).click();
+    await page.getByLabel('Workflow YAML', { exact: true }).fill('cases:\n  - name: shorthand\n    steps:\n      - click_by_text: Submit\n      - aiKeyboardPress: Enter\n      - aiQuery: page title\n');
+    await page.getByRole('tab', { name: '可视化编辑', exact: true }).click();
+    await expect(page.getByLabel('目标文本 1', { exact: true })).toHaveValue('Submit');
+    await page.getByLabel('最长等待（毫秒） 1', { exact: true }).fill('1000');
+    assert.deepEqual(parse(await source()).cases[0].steps[0].click_by_text, { text: 'Submit', timeoutMs: 1000 });
+    await expect(page.getByLabel('按键 2', { exact: true })).toHaveValue('Enter');
+    await page.getByLabel('目标或操作描述 2', { exact: true }).fill('搜索输入框');
+    assert.deepEqual(parse(await source()).cases[0].steps[1].aiKeyboardPress, { keyName: 'Enter', prompt: '搜索输入框' });
+    await expect(page.getByLabel('数据要求 3', { exact: true })).toHaveValue('page title');
+    await page.getByLabel('数据要求 3', { exact: true }).fill('page heading');
+    assert.equal(parse(await source()).cases[0].steps[2].aiQuery, 'page heading');
+    await page.getByRole('tab', { name: 'YAML', exact: true }).click();
+    await page.getByLabel('Workflow YAML', { exact: true }).fill(beforeShorthand);
+    await page.getByRole('tab', { name: '可视化编辑', exact: true }).click();
 
     await page.getByRole('tab', { name: '变量与数据集', exact: true }).click();
     const variables = page.getByRole('region', { name: '用例默认变量', exact: true });

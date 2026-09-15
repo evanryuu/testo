@@ -1,4 +1,5 @@
 import type { Variables, DebugSelection } from './workflow-document.js';
+import type { DocumentImportApi } from './document-import-api.js';
 import type { ChromeProfileInfo } from './browser.js';
 import type { RecordingDraft, RecordingFrame, RecordingInteraction } from './recording.js';
 import type { RecordingStepChoice, RecordingAssertion, RecordingReviewStep } from '../recording/workflow.js';
@@ -45,18 +46,18 @@ export interface BatchRun {
     status: 'queued' | 'running' | 'skipped' | 'interrupted' | RunResult['status']; runId?: string; error?: string }[];
 }
 export interface ProjectAssets { revision: string; variables: Variables; flows: Record<string, { name: string; steps: Record<string, unknown>[] }> }
-export interface RunConfiguration { variables?: Variables; timeoutMs?: number; loginCondition?: string; dependent?: boolean }
+export interface RunConfiguration { variables?: Variables; timeoutMs?: number; loginCondition?: string; dependent?: boolean; allowUnverifiedGenerated?: boolean }
 export type RetryMode = 'failed' | 'unfinished' | 'all';
 export interface RunSnapshot { environmentId: string; baseUrl: string; variables: Variables; defaults?: Variables; flows?: ProjectAssets['flows']; model: { name: string; baseUrl: string; family: string }; git?: { commit?: string; branch?: string; dirty: boolean }; timeoutMs?: number; loginCondition?: string }
 export interface RunInput extends RunConfiguration { projectId: string; caseId: string; workflowId: string; environmentId: string; browserMode?: 'isolated' | 'bridge'; sessionId?: string; datasetId?: string; debug?: DebugSelection }
-export interface RetryBatchInput { id: string; mode: RetryMode; sessionId: string; variables?: Variables }
+export interface RetryBatchInput { allowUnverifiedGenerated?: boolean; id: string; mode: RetryMode; sessionId: string; variables?: Variables }
 export interface PreflightResult { ready: boolean; checks: { name: string; status: 'passed' | 'failed' | 'info'; message: string }[]; variables: Variables; steps: number }
 export interface HistoryQuery { projectId?: string; caseId?: string; status?: string; environment?: string; after?: string; before?: string; offset?: number; limit?: number }
 export interface HistoryPage { runs: HistoryRun[]; total: number }
 export interface ModelSettings { name: string; baseUrl: string; family: string; hasApiKey: boolean }
 export interface WorkspaceState { projects: Project[]; runs: HistoryRun[]; batches?: BatchRun[]; sessions?: BrowserSession[]; activeBatchId?: string; connectingSession?: boolean; activeRunId?: string; recording?: RecordingDraft; model: ModelSettings; errors: string[] }
 export interface UpdateState { version: string; enabled: boolean; status: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'downloaded' | 'error'; message: string; nextVersion?: string; percent?: number }
-export interface DesktopApi {
+export interface DesktopApi extends DocumentImportApi {
   appInfo(): Promise<{ dataDirectory: string; update: UpdateState }>;
   checkUpdate(): Promise<UpdateState>;
   downloadUpdate(): Promise<UpdateState>;
