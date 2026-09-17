@@ -127,15 +127,15 @@ function configurationSnapshot(project: Project, environmentId: string, input: R
     model: { name: env.MIDSCENE_MODEL_NAME ?? '', baseUrl: env.MIDSCENE_MODEL_BASE_URL ?? env.OPENAI_BASE_URL ?? '', family: env.MIDSCENE_MODEL_FAMILY ?? '' }, git: { branch: git.branch, commit: git.commit, dirty: !!git.status },
     timeoutMs: input.timeoutMs, loginCondition: input.loginCondition?.trim() || undefined };
 }
-function prepareRun(i: RunInput, project = store.project(i.projectId), snapshot = configurationSnapshot(project, i.environmentId, i), savedText?: string) {
+function prepareRun(i: RunInput, project = store.project(i.projectId), snapshot = configurationSnapshot(project, i.environmentId, i)) {
   const item = project.cases.find(item => item.id === i.caseId);
   if (!item) throw new Error('用例不存在或无法读取');
   const { file, platform } = store.workflowLocationFromProject(project, i.caseId, i.workflowId);
   if (platform !== 'web') throw new Error('当前版本只支持执行 Web Workflow');
   const environment = project.environments.find(e => e.id === i.environmentId);
   if (!environment) throw new Error('请选择运行环境');
-  if (!savedText && !existsSync(file)) throw new Error(`${item.name} 尚未保存 Workflow`);
-  const sourceText = savedText ?? readFileSync(file, 'utf8');
+  if (!existsSync(file)) throw new Error(`${item.name} 尚未保存 Workflow`);
+  const sourceText = readFileSync(file, 'utf8');
   let text = sourceText;
   if (snapshot.loginCondition) {
     const document = parseWorkflow(text);
@@ -184,12 +184,18 @@ async function startBatch(i: BatchInput, project: Project, groupPlan?: ReturnTyp
   if (!Array.isArray(i.items) || !i.items.length || i.items.length > 10000) throw new Error('请选择 1 至 10000 个用例');
   if (i.failurePolicy !== 'stop' && i.failurePolicy !== 'continue') throw new Error('请选择失败处理方式');
   const snapshot = retry?.source.snapshot ? { ...structuredClone(retry.source.snapshot), variables: validateVariables(i.variables ?? retry.source.snapshot.variables) } : configurationSnapshot(project, i.environmentId, i);
+  if (retry) {
+    // Retry current scripts with the original run settings, then freeze this attempt.
+    snapshot.flows = structuredClone(project.assets?.flows ?? {});
+    const git = gitInfo(project.root, false);
+    snapshot.git = { branch: git.branch, commit: git.commit, dirty: !!git.status };
+  }
   const executionEnvironment = modelEnvironment();
   // Model identifiers stay fixed for the batch, including a retry. Credentials remain local.
   for (const key of ['MIDSCENE_MODEL_NAME', 'MIDSCENE_MODEL_BASE_URL', 'MIDSCENE_MODEL_FAMILY', 'OPENAI_BASE_URL']) delete executionEnvironment[key];
   for (const [key, value] of Object.entries({ MIDSCENE_MODEL_NAME: snapshot.model.name, MIDSCENE_MODEL_BASE_URL: snapshot.model.baseUrl, MIDSCENE_MODEL_FAMILY: snapshot.model.family })) if (value) executionEnvironment[key] = value;
-  const plans = i.items.map((entry, index) => {
-    const plan = prepareRun({ ...entry, ...i, caseId: entry.caseId, workflowId: entry.workflowId, datasetId: entry.datasetId, browserMode: 'bridge' }, project, snapshot, retry?.items[index]?.definition);
+  const plans = i.items.map(entry => {
+    const plan = prepareRun({ ...entry, ...i, caseId: entry.caseId, workflowId: entry.workflowId, datasetId: entry.datasetId, browserMode: 'bridge' }, project, snapshot);
     assertImportedRun(plan.file, plan.sourceText, snapshot, entry.datasetId, 'bridge', i.allowUnverifiedGenerated === true);
     assertWorkflowModel(plan.validation, snapshot.model.name);
     const session = sessions.get(entry.sessionId);
@@ -267,7 +273,6 @@ const handlers: Record<string, (input: any) => unknown> = {
     const source = history.batch(i.id); if (!source) throw new Error('原批次不存在');
     if (!source.snapshot || !source.environmentId) throw new Error('旧批次没有完整配置快照，请配置新批次');
     const items = retryItems(source, i.mode), project = store.project(source.projectId);
-    if (items.some(item => !item.definition)) throw new Error('原批次缺少用例快照，请配置新批次');
     return startBatch({ projectId: source.projectId, environmentId: source.environmentId, failurePolicy: source.failurePolicy, dependent: source.dependent, allowUnverifiedGenerated: i.allowUnverifiedGenerated, variables: i.variables ?? source.snapshot.variables,
       items: items.map(item => ({ caseId: item.caseId, workflowId: item.workflowId, datasetId: item.datasetId, sessionId: i.sessionId })) }, project, undefined, { source, mode: i.mode, items });
   },

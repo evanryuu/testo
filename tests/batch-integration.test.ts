@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -259,7 +259,7 @@ window.startAutoBridge = (url) => {
 });
 
 
-test('desktop connector batches freeze shared inputs and workflows, and retry the intended failed or dependent items', { timeout: 240_000 }, async () => {
+test('desktop connector batches freeze active runs and reload current workflows and shared steps on retry', { timeout: 240_000 }, async () => {
   const root = process.cwd();
   mkdirSync('artifacts', { recursive: true });
   const dir = mkdtempSync(path.resolve('artifacts/batch-snapshots-'));
@@ -298,7 +298,8 @@ test('desktop connector batches freeze shared inputs and workflows, and retry th
   } }] };
   try {
     chrome = await chromium.launchPersistentContext(path.join(dir, 'chrome'), {
-      channel: 'chromium', executablePath: process.env.TEST_CHROME_EXECUTABLE, headless: false, viewport: null,
+      // Keep desktop keyboard input out of the fixture while exercising the real connector.
+      channel: 'chromium', executablePath: process.env.TEST_CHROME_EXECUTABLE, headless: true, viewport: null,
       args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
     });
     const worker = chrome.serviceWorkers()[0] ?? await chrome.waitForEvent('serviceworker');
@@ -308,6 +309,19 @@ test('desktop connector batches freeze shared inputs and workflows, and retry th
     await other.evaluate(() => sessionStorage.setItem('who', 'other-tab'));
     app = await electron.launch({ args: [root], env, timeout: 45_000 });
     ui = await app.firstWindow(); ui.setDefaultTimeout(15000);
+    // Restore this test's profile on a private port so existing connectors cannot join it.
+    const profileId = (await ui.evaluate(() => window.workspace.addBrowserProfile())).id;
+    const profilePort = await findAvailablePort(20000 + Math.floor(Math.random() * 20000), 1000);
+    await app.evaluate(({ safeStorage }, { file, port }) => {
+      const { readFileSync, writeFileSync } = process.getBuiltinModule('fs');
+      const entries = JSON.parse(safeStorage.decryptString(readFileSync(file)));
+      entries[0].port = port;
+      writeFileSync(file, safeStorage.encryptString(JSON.stringify(entries)), { mode: 0o600 });
+    }, { file: path.join(dir, 'app', 'browser-profiles.enc'), port: profilePort });
+    await app.close();
+    app = await electron.launch({ args: [root], env, timeout: 45_000 });
+    ui = await app.firstWindow(); ui.setDefaultTimeout(15000);
+    const profile = (await ui.evaluate(() => window.workspace.browserProfiles())).find(item => item.id === profileId)!;
     const uiErrors: string[] = []; ui.on('pageerror', error => uiErrors.push(error.message));
     const refs = await ui.evaluate(async ({ baseUrl, flow }) => {
       const projectId = await window.workspace.createProject({ name: 'Batch snapshots', description: 'Real connector and runner checks' });
@@ -340,7 +354,6 @@ test('desktop connector batches freeze shared inputs and workflows, and retry th
     for (let index = 0; index < definitions.length; index++) await saveDefinition(index, definitions[index]!);
 
     // Pair the actual shipped extension and select a precise tab through the public desktop API.
-    const profile = await ui.evaluate(() => window.workspace.addBrowserProfile());
     const settings = await chrome.newPage();
     await settings.goto(`chrome-extension://${new URL(worker.url()).host}/options.html`);
     await settings.getByLabel('连接名称').fill('Batch integration profile');
@@ -367,20 +380,20 @@ test('desktop connector batches freeze shared inputs and workflows, and retry th
       assert.ok(batch.finishedAt); assert.equal(state.activeBatchId, undefined);
       completed.push(batch); return batch;
     };
-    const verifySnapshots = async (batch: BatchRun, expectedName: string) => {
+    const verifySnapshots = async (batch: BatchRun, expectedName: string, expectedDefinitions = definitions, expectedFlow = flow) => {
       assert.deepEqual(batch.snapshot!.variables, { knowledgeBaseName: expectedName });
-      assert.deepEqual(batch.snapshot!.flows!.fillName, flow, 'batch uses the shared flow captured before starting');
+      assert.deepEqual(batch.snapshot!.flows!.fillName, expectedFlow, 'batch uses the shared flow captured before starting');
       for (const item of batch.items) {
         const index = refs.cases.findIndex(ref => ref.caseId === item.caseId);
         assert.equal(item.datasetId, 'smoke');
-        assert.equal(item.definition, definitions[index], 'batch stores the original editable YAML');
+        assert.equal(item.definition, expectedDefinitions[index], 'batch stores the YAML read for this attempt');
         if (!item.runId) continue;
         const detail = await ui!.evaluate(runId => window.workspace.runDetail({ runId }), item.runId);
         assert.ok(detail.events.some(event => event.type === 'step-started'), 'full history exposes real runner steps');
         assert.deepEqual(detail.snapshot, batch.snapshot);
         assert.equal(detail.result!.definitionHash, item.definitionHash);
         const artifact = detail.result!.artifactDirectory;
-        assert.equal(readFileSync(path.join(artifact, 'workflow.yaml'), 'utf8'), definitions[index]);
+        assert.equal(readFileSync(path.join(artifact, 'workflow.yaml'), 'utf8'), expectedDefinitions[index]);
         const configuration = JSON.parse(readFileSync(path.join(artifact, 'run-configuration.json'), 'utf8'));
         assert.equal(configuration.variables.knowledgeBaseName, expectedName);
         assert.equal(configuration.datasetId, 'smoke');
@@ -388,7 +401,7 @@ test('desktop connector batches freeze shared inputs and workflows, and retry th
         const compiledSteps = parse(compiled).cases[0].steps;
         assert.ok(compiledSteps.some((step: any) => step.recordedAction?.actionType === 'Input' && step.recordedAction.payload.value === '${knowledgeBaseName}'));
         assert.ok(!compiledSteps.some((step: any) => step.useFlow), 'shared flows are expanded before execution');
-        assert.ok(!compiled.includes('poison'), 'queued runs and retries ignore later source edits');
+        assert.ok(!compiled.includes('poison'), 'queued runs ignore edits made after this attempt starts');
       }
     };
 
@@ -407,21 +420,53 @@ test('desktop connector batches freeze shared inputs and workflows, and retry th
     ], 'create and delete receive exactly the same batch override in the chosen tab');
     await verifySnapshots(firstBatch, String(input.variables!.knowledgeBaseName));
 
+    // Saved edits must affect each new attempt, including scripts skipped by the first batch.
+    const revisedDefinitions = [...definitions];
+    for (const index of [1, 2]) {
+      const document = parse(definitions[index]!);
+      document.cases[0].name += ' revised';
+      const action = index === 1 ? 'after' : 'create';
+      document.cases[0].steps[2].recordedAction = { actionType: 'Tap', payload: { x: index === 1 ? 310 : 70, y: 100 }, target: { tag: 'button', testId: action } };
+      document.cases[0].steps[3].assertText.text = '${knowledgeBaseName} revised ' + action + ' completed';
+      revisedDefinitions[index] = stringify(document);
+      await saveDefinition(index, revisedDefinitions[index]!);
+    }
+    const revisedFlow = { ...flow, name: 'Revised fill name', steps: [...flow.steps, { recordedAction: {
+      actionType: 'Input', payload: { x: 70, y: 35, value: '${knowledgeBaseName} revised', mode: 'replace' },
+      target: { tag: 'input', name: 'Knowledge base name' },
+    } }] };
+    await ui.evaluate(async ({ projectId, flow }) => {
+      const project = (await window.workspace.state()).projects.find(item => item.id === projectId)!;
+      await window.workspace.saveAssets({ projectId, revision: project.assets!.revision, variables: { knowledgeBaseName: 'changed project default' }, flows: { fillName: flow } });
+    }, { projectId: refs.projectId, flow: revisedFlow });
     allowDelete = true;
-    const failedRetry = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'failed' as const, sessionId }));
+    await ui.getByRole('button', { name: 'Run History', exact: true }).click();
+    await ui.getByTestId('batch-history-row').click();
+    await expect(ui.getByText('重跑前会读取最新保存的 YAML 和共享步骤', { exact: false })).toBeVisible();
+    await ui.getByLabel('重跑标签页', { exact: true }).selectOption(sessionId);
+    await ui.getByRole('button', { name: '重跑失败用例', exact: true }).scrollIntoViewIfNeeded();
+    await ui.screenshot({ path: path.join(dir, 'retry-current-scripts.png') });
+    await ui.getByRole('button', { name: '重跑失败用例', exact: true }).click();
+    await expect.poll(async () => (await ui!.evaluate(() => window.workspace.state())).batches!.find(batch => batch.sourceBatchId === firstId)?.id).toBeTruthy();
+    const failedRetryId = (await ui.evaluate(() => window.workspace.state())).batches!.find(batch => batch.sourceBatchId === firstId)!.id;
+    const failedRetry = await waitForBatch(failedRetryId);
     assert.equal(failedRetry.status, 'passed', JSON.stringify(failedRetry));
     assert.equal(failedRetry.sourceBatchId, firstId); assert.equal(failedRetry.retryMode, 'failed');
     assert.deepEqual(failedRetry.items.map(item => item.caseId), [refs.cases[1]!.caseId]);
-    assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'delete']);
-    await verifySnapshots(failedRetry, String(input.variables!.knowledgeBaseName));
+    assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'after']);
+    assert.notEqual(failedRetry.items[0]!.definitionHash, firstBatch.items[1]!.definitionHash);
+    assert.deepEqual(failedRetry.snapshot!.defaults, firstBatch.snapshot!.defaults, 'retry keeps the original run inputs');
+    await verifySnapshots(failedRetry, String(input.variables!.knowledgeBaseName), revisedDefinitions, revisedFlow);
     const unfinishedRetry = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'unfinished' as const, sessionId }));
     assert.equal(unfinishedRetry.status, 'passed', JSON.stringify(unfinishedRetry));
     assert.deepEqual(unfinishedRetry.items.map(item => item.caseId), [refs.cases[2]!.caseId]);
-    assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'delete', 'after']);
-    await verifySnapshots(unfinishedRetry, String(input.variables!.knowledgeBaseName));
+    assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'after', 'create']);
+    assert.ok(hits.slice(-2).every(hit => hit.name === input.variables!.knowledgeBaseName + ' revised'), 'retry executes the revised shared flow');
+    await verifySnapshots(unfinishedRetry, String(input.variables!.knowledgeBaseName), revisedDefinitions, revisedFlow);
 
     // A dependent scenario restarts from its first case, even when the user chooses failed only.
     await saveDefinition(1, definitions[1]!);
+    await saveDefinition(2, definitions[2]!);
     await ui.evaluate(async ({ projectId, flow }) => {
       const project = (await window.workspace.state()).projects.find(item => item.id === projectId)!;
       await window.workspace.saveAssets({ projectId, revision: project.assets!.revision, variables: { knowledgeBaseName: 'project default' }, flows: { fillName: flow } });
@@ -439,13 +484,56 @@ test('desktop connector batches freeze shared inputs and workflows, and retry th
     assert.deepEqual(restarted.items.map(item => item.caseId), refs.cases.map(item => item.caseId));
     assert.deepEqual(hits.slice(-3).map(hit => [hit.action, hit.name]), [['create', retryName], ['delete', retryName], ['after', retryName]]);
     await verifySnapshots(restarted, retryName);
+
+    // An all-items retry also reads edits made since the previous attempt.
+    // Keep the original flow here; only the workflow changes for this attempt.
+    const allDefinitions = revisedDefinitions.map(text => text!.replaceAll('${knowledgeBaseName} revised', '${knowledgeBaseName}'));
+    await saveDefinition(1, allDefinitions[1]!);
+    await saveDefinition(2, allDefinitions[2]!);
+    const allRetry = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'all' as const, sessionId }));
+    assert.equal(allRetry.status, 'passed', JSON.stringify(allRetry));
+    assert.deepEqual(hits.slice(-3).map(hit => hit.action), ['create', 'after', 'create']);
+    await verifySnapshots(allRetry, String(input.variables!.knowledgeBaseName), allDefinitions);
+
+    const project = (await ui.evaluate(() => window.workspace.state())).projects.find(item => item.id === refs.projectId)!;
+    const editedCase = project.cases.find(item => item.id === refs.cases[1]!.caseId)!;
+    const suite = project.suites.find(item => item.id === editedCase.suiteId)!;
+    const editedFile = path.join(project.root, suite.directory, editedCase.id, editedCase.workflows[0]!.definitionPath);
+    const rejectRetry = async (pattern: RegExp) => {
+      const before = await ui!.evaluate(() => window.workspace.state());
+      const hitCount = hits.length;
+      await assert.rejects(ui!.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'all' as const, sessionId }), pattern);
+      const after = await ui!.evaluate(() => window.workspace.state());
+      assert.equal(after.batches!.length, before.batches!.length);
+      assert.equal(after.runs.length, before.runs.length);
+      assert.equal(after.activeBatchId, undefined);
+      assert.equal(hits.length, hitCount, 'invalid current scripts cannot start any browser action');
+    };
+    try {
+      writeFileSync(editedFile, 'cases: [');
+      await rejectRetry(/YAML|flow sequence/i);
+    } finally { writeFileSync(editedFile, allDefinitions[1]!); }
+    const parkedFile = editedFile + '.saved';
+    renameSync(editedFile, parkedFile);
+    try { await rejectRetry(/尚未保存 Workflow/); }
+    finally { renameSync(parkedFile, editedFile); }
+    const noDataset = parse(allDefinitions[1]!); noDataset.testo.datasets = [];
+    try {
+      writeFileSync(editedFile, stringify(noDataset));
+      await rejectRetry(/数据集/);
+    } finally { writeFileSync(editedFile, allDefinitions[1]!); }
+    const assetsFile = path.join(project.root, 'resources.yaml'), savedAssets = readFileSync(assetsFile, 'utf8');
+    try {
+      writeFileSync(assetsFile, stringify({ ...parse(savedAssets), flows: {} }));
+      await rejectRetry(/共享步骤|共享流程/);
+    } finally { writeFileSync(assetsFile, savedAssets); }
     const finalState = await ui.evaluate(() => window.workspace.state());
     assert.deepEqual(finalState.batches!.find(batch => batch.id === firstId), firstBatch, 'retries leave the original batch unchanged');
     assert.deepEqual(finalState.batches!.find(batch => batch.id === dependent.id), dependent);
-    assert.equal(hits.length, 9); assert.ok(hits.every(hit => hit.who === 'chosen-tab'));
+    assert.equal(hits.length, 12); assert.ok(hits.every(hit => hit.who === 'chosen-tab'));
     assert.equal(await other.locator('#result').textContent(), 'Ready', 'another page with the same origin receives no action');
     const history = await ui.evaluate(projectId => window.workspace.history({ projectId, offset: 0, limit: 2 }), refs.projectId);
-    assert.equal(history.total, 9); assert.equal(history.runs.length, 2);
+    assert.equal(history.total, 12); assert.equal(history.runs.length, 2);
     assert.ok(history.runs.every(run => run.events.length === 0), 'history lists stay light; full events are fetched on demand');
     assert.deepEqual(uiErrors, []);
     await target.screenshot({ path: path.join(dir, 'chosen-tab-result.png') });
