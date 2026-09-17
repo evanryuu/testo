@@ -272,6 +272,15 @@ const handlers: Record<string, (input: any) => unknown> = {
       items: items.map(item => ({ caseId: item.caseId, workflowId: item.workflowId, datasetId: item.datasetId, sessionId: i.sessionId })) }, project, undefined, { source, mode: i.mode, items });
   },
   createProject: (i) => store.create(i.name, i.description ?? ''),
+  removeProject: (input: unknown) => {
+    const i = z.object({ projectId: z.string().trim().min(1).max(100) }).strict().parse(input);
+    if (occupied()) throw new Error('请等待当前运行或浏览器连接结束后再移除项目');
+    const draft = recorder.draft;
+    if (draft && draft.status !== 'saved' && draft.projectId === i.projectId) throw new Error('项目有未保存的录制，请先保存或放弃录制');
+    store.removeProject(i.projectId);
+    for (const [id, session] of sessions) if (session.info.projectId === i.projectId) sessions.delete(id);
+    for (const key of chromeTargets.keys()) if (JSON.parse(key)[0] === i.projectId) chromeTargets.delete(key);
+  },
   openProject: async () => {
     const result = await dialog.showOpenDialog(mainWindow, { title: '打开包含 workspace.yaml 的项目文件夹', properties: ['openDirectory'] });
     return result.canceled ? null : store.open(result.filePaths[0]!);

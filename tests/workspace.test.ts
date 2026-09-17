@@ -31,6 +31,27 @@ test('external edits are preserved when an outdated editor tries to save', () =>
   assert.throws(() => store.saveCase({ projectId: id, caseId, revision: location.item.revision, name: 'Overwrite', description: '', priority: 'P0', tags: [] }), /外部修改/);
   assert.equal(store.project(id).cases[0]?.name, 'Externally changed');
 });
+test('removing a project persists without changing its files, other projects or history and allows reopening', () => {
+  const { dir, store } = setup();
+  const id = store.create('Remove me', 'Keep my files');
+  const otherId = store.create('Keep me', '');
+  const caseId = store.createCase(id, 'Preserved case', store.project(id).suites[0]!.id, ['web']);
+  const original = store.project(id), other = store.project(otherId);
+  const file = store.caseLocation(id, caseId).file;
+  const text = readFileSync(file, 'utf8');
+  const history = new HistoryStore(path.join(dir, 'runs.db'));
+  history.save({ projectId: id, caseId, caseName: 'Preserved case', runId: 'preserved-run', environment: 'Local', status: 'passed', startedAt: new Date().toISOString(), events: [] });
+  assert.throws(() => store.removeProject('unknown'), /项目不存在/);
+  assert.equal(store.list().projects.length, 2);
+  store.removeProject(id);
+  assert.deepEqual(store.list().projects, [other]);
+  assert.equal(readFileSync(file, 'utf8'), text);
+  assert.equal(history.list()[0]?.runId, 'preserved-run');
+  const reloaded = new WorkspaceStore(path.join(dir, 'data'), path.join(dir, 'projects'));
+  assert.deepEqual(reloaded.list().projects, [other]);
+  assert.equal(reloaded.open(original.root), id);
+  assert.deepEqual(reloaded.project(id), original);
+});
 test('workflow import preserves identity and rejects stale writes', () => {
   const { store } = setup();
   const projectId = store.create('Test', '');

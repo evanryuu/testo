@@ -54,6 +54,12 @@ export class WorkspaceStore {
     return project.id;
   }
   open(root: string): string { return this.register(realpathSync(root)); }
+  removeProject(id: string): void {
+    const project = this.project(required(id, '项目 ID'));
+    const roots = this.roots.filter(root => root !== project.root);
+    writeAtomic(path.join(this.dataDir, 'projects.json'), JSON.stringify(roots));
+    this.roots = roots;
+  }
   list(): { projects: Project[]; errors: string[] } {
     const projects: Project[] = [], errors: string[] = [];
     for (const root of this.roots) {

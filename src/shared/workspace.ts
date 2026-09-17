@@ -65,6 +65,7 @@ export interface DesktopApi extends DocumentImportApi {
   state(): Promise<WorkspaceState>;
   createProject(input: { name: string; description: string }): Promise<string>;
   openProject(): Promise<string | null>;
+  removeProject(input: { projectId: string }): Promise<void>;
   bulkCases(input: BulkCaseInput): Promise<BulkCaseResult>;
   saveGroup(input: SaveGroupInput): Promise<string>;
   deleteGroup(input: { projectId: string; id: string; revision: string }): Promise<void>;
