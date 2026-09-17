@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Check, Clock3, LoaderCircle, Play, Square } from 'lucide-react';
-import type { BatchRun, Project, TestCase, WorkspaceState } from '../shared/workspace.js';
+import type { BatchAttempt, BatchRun, Project, TestCase, WorkspaceState } from '../shared/workspace.js';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ChromeTabPicker } from './ChromeTabPicker.js';
@@ -15,6 +15,24 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 const names: Record<string, string> = { queued: '排队中', running: '运行中', passed: '通过', failed: '失败', error: '错误', skipped: '已跳过', cancelled: '已取消', interrupted: '已中断' };
 export function BatchStatus({ status }: { status: string }) {
   return <Badge data-status={status} variant="secondary" className={status === 'passed' ? 'bg-emerald-50 text-emerald-700' : status === 'failed' || status === 'error' ? 'bg-red-50 text-red-700' : ''}>{status === 'running' ? <LoaderCircle className="size-3 animate-spin" /> : status === 'passed' ? <Check className="size-3" /> : <Clock3 className="size-3" />}{names[status] ?? status}</Badge>;
+}
+
+function AttemptHistory({ attempts, openRun }: { attempts: BatchAttempt[]; openRun(id: string): void }) {
+  const [selected, setSelected] = useState<number>();
+  const [page, setPage] = useState(0);
+  const attempt = attempts.find(item => item.number === selected) ?? attempts[attempts.length - 1];
+  if (!attempt) return null;
+  return <Card data-testid="batch-attempt-history"><CardHeader><CardTitle>运行记录</CardTitle></CardHeader><CardContent className="space-y-4">
+    <NativeSelect aria-label="查看运行轮次" value={attempt.number} onChange={event => { setSelected(Number(event.target.value)); setPage(0); }}>
+      {[...attempts].reverse().map(item => <NativeSelectOption key={item.number} value={item.number}>{item.number === 0 ? '首次运行' : `第 ${item.number} 次重跑`} · {item.items.length} 个用例 · {names[item.status]}</NativeSelectOption>)}
+    </NativeSelect>
+    <p className="text-xs text-muted-foreground">{new Date(attempt.startedAt).toLocaleString('zh-CN')} · {attempt.mode === 'failed' ? '重跑失败用例' : attempt.mode === 'unfinished' ? '运行未完成用例' : attempt.mode === 'all' ? '重跑整个批次' : '首次运行'}</p>
+    <div className="divide-y">{attempt.items.slice(page * 50, (page + 1) * 50).map((item, index) => <div key={index} data-testid="batch-attempt-item" className="flex flex-wrap items-center gap-3 py-3">
+      <div className="min-w-0 flex-1"><p className="text-sm">{item.caseName}</p>{item.error ? <p className="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{item.error}</p> : null}</div>
+      <BatchStatus status={item.status} /><Button size="sm" variant="outline" disabled={!item.runId} onClick={() => item.runId && openRun(item.runId)}>查看本次详情</Button>
+    </div>)}</div>
+    {attempt.items.length > 50 ? <div className="flex justify-end gap-3"><Button variant="outline" disabled={page === 0} onClick={() => setPage(value => value - 1)}>上一页记录</Button><span>{page + 1} / {Math.ceil(attempt.items.length / 50)}</span><Button variant="outline" disabled={(page + 1) * 50 >= attempt.items.length} onClick={() => setPage(value => value + 1)}>下一页记录</Button></div> : null}
+  </CardContent></Card>;
 }
 
 export function BatchView({ project, cases, state, batch, refresh, started, openRun, configure, groupIds }: {
@@ -82,13 +100,15 @@ export function BatchView({ project, cases, state, batch, refresh, started, open
   const trialChoice = <label className="flex items-start gap-2 text-sm"><Checkbox checked={allowUnverifiedGenerated} onCheckedChange={value => setAllowUnverifiedGenerated(value === true)} disabled={locked} />允许试跑当前版本尚未验证的生成用例（会真实操作所选页面）</label>;
   if (batch) return <div data-testid="batch-results" className="space-y-5">
     {error ? <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert> : null}
+    <p data-testid="batch-aggregate-summary" className="text-sm">已通过 {batch.items.filter(item => item.status === 'passed').length} / {batch.items.length} 个用例 · 已重跑 {Math.max(0, (batch.attempts?.length ?? 1) - 1)} 次。汇总显示各用例的最新结果。</p>
     <Card><CardHeader className="flex flex-row items-center justify-between gap-4"><div className="space-y-2"><CardTitle>批次运行结果</CardTitle><p className="text-sm text-muted-foreground">{batch.environment} · {batch.items.length} 个用例 · {batch.failurePolicy === 'stop' ? '失败后停止' : '失败后继续'}</p></div><BatchStatus status={batch.status} /></CardHeader><CardContent>{batch.groups?.length ? <p className="mb-2 text-sm" data-testid="batch-source-groups">Group：{batch.groups.slice(0, 10).map(group => group.name).join("、")}{batch.groups.length > 10 ? ` 等 ${batch.groups.length} 组` : ""}</p> : null}<p className="mb-2 text-sm">已完成 {batch.items.filter(item => !["running", "queued"].includes(item.status)).length} / {batch.items.length} 个用例</p><p className="text-xs text-muted-foreground">{new Date(batch.startedAt).toLocaleString('zh-CN')} · 各用例按列表顺序逐个执行</p></CardContent></Card>
     <Card className="gap-0 overflow-hidden py-0">{batch.items.slice(resultPage * pageSize, (resultPage + 1) * pageSize).map((item, index) => <div key={index} data-testid="batch-result-item" className="flex flex-wrap items-center gap-4 border-b px-5 py-4 last:border-b-0">
       <span className="text-xs text-muted-foreground">{String(resultPage * pageSize + index + 1).padStart(2, '0')}</span><div className="min-w-0 flex-1"><strong className="text-sm">{item.caseName}</strong><p className="mt-1 text-xs text-muted-foreground">运行标签页：{item.sessionName}</p>{item.groupNames?.length ? <p className="mt-1 text-xs text-muted-foreground">Group：{item.groupNames.slice(0, 3).join("、")}{item.groupNames.length > 3 ? ` 等 ${item.groupNames.length} 组` : ""}</p> : null}{item.error ? <p className="mt-2 whitespace-pre-wrap break-words text-xs text-destructive">{item.error}</p> : null}</div><BatchStatus status={item.status} /><Button size="sm" variant="outline" disabled={!item.runId} onClick={() => item.runId && openRun(item.runId)}>查看单例详情</Button>
     </div>)}</Card>
     {batch.items.length > pageSize ? <div className="flex items-center justify-end gap-3"><Button variant="outline" disabled={resultPage === 0} onClick={() => setResultPage(page => page - 1)}>上一页结果</Button><span className="text-sm">{resultPage + 1} / {Math.ceil(batch.items.length / pageSize)}</span><Button variant="outline" disabled={(resultPage + 1) * pageSize >= batch.items.length} onClick={() => setResultPage(page => page + 1)}>下一页结果</Button>{batch.status === 'running' ? <Button variant="outline" onClick={() => setResultPage(Math.floor(Math.max(0, batch.items.findIndex(item => item.status === 'running')) / pageSize))}>定位正在运行</Button> : null}</div> : null}
-    {batch.status !== 'running' && project && batch.snapshot ? <Card><CardHeader><CardTitle>从这个批次重新运行</CardTitle></CardHeader><CardContent className="space-y-4">
-      <p className="text-sm text-muted-foreground">重跑前会读取最新保存的 YAML 和共享步骤，保留原批次的用例顺序和运行配置。请重新选择运行标签页。{batch.dependent ? '此批次包含前后依赖，重跑时会从第一条用例完整执行。' : ''}</p>
+    {batch.attempts?.length ? <AttemptHistory key={batch.attempts.length} attempts={batch.attempts} openRun={openRun} /> : null}
+    {batch.status !== 'running' && project && batch.snapshot ? <Card><CardHeader><CardTitle>在当前批次重跑</CardTitle></CardHeader><CardContent className="space-y-4">
+      <p className="text-sm text-muted-foreground">重跑前会读取最新保存的 YAML 和共享步骤，保留原批次的用例顺序和运行配置。结果会聚合到当前批次，历次记录仍可查看。请重新选择运行标签页。{batch.dependent ? '此批次包含前后依赖，重跑时会从第一条用例完整执行。' : ''}</p>
       {batch.sourceBatchId && <p className="text-xs">来源批次：{batch.sourceBatchId}</p>}
       <ChromeTabPicker projectId={project.id} environmentId={batch.environmentId!} disabled={locked} onBusy={setPickerBusy} selected={async id => { setGroupSession(id); await refresh(); }} />
       <NativeSelect aria-label="重跑标签页" value={targetSession} onChange={event => setGroupSession(event.target.value)} disabled={locked}><NativeSelectOption value="">请选择运行标签页</NativeSelectOption>{sessions.map(session => <NativeSelectOption key={session.id} value={session.id}>{session.name}</NativeSelectOption>)}</NativeSelect>

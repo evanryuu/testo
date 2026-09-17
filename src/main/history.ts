@@ -18,6 +18,11 @@ export class HistoryStore {
       const batch = JSON.parse(String(row.payload)) as BatchRun;
       batch.status = 'interrupted';
       for (const item of batch.items) if (item.status === 'running' || item.status === 'queued') item.status = 'interrupted';
+      for (const attempt of batch.attempts ?? []) if (attempt.status === 'running') {
+        attempt.status = 'interrupted';
+        attempt.finishedAt = new Date().toISOString();
+        for (const item of attempt.items) if (item.status === 'running' || item.status === 'queued') item.status = 'interrupted';
+      }
       this.saveBatch(batch);
     }
     this.db.exec("UPDATE runs SET payload=json_set(payload, '$.status', 'interrupted') WHERE json_extract(payload, '$.status') = 'running'");

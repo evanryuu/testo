@@ -381,16 +381,17 @@ test('desktop connector batches freeze active runs and reload current workflows 
       completed.push(batch); return batch;
     };
     const verifySnapshots = async (batch: BatchRun, expectedName: string, expectedDefinitions = definitions, expectedFlow = flow) => {
-      assert.deepEqual(batch.snapshot!.variables, { knowledgeBaseName: expectedName });
-      assert.deepEqual(batch.snapshot!.flows!.fillName, expectedFlow, 'batch uses the shared flow captured before starting');
-      for (const item of batch.items) {
+      const attempt = batch.attempts!.at(-1)!;
+      assert.deepEqual(attempt.snapshot!.variables, { knowledgeBaseName: expectedName });
+      assert.deepEqual(attempt.snapshot!.flows!.fillName, expectedFlow, 'batch uses the shared flow captured before starting');
+      for (const item of attempt.items) {
         const index = refs.cases.findIndex(ref => ref.caseId === item.caseId);
         assert.equal(item.datasetId, 'smoke');
         assert.equal(item.definition, expectedDefinitions[index], 'batch stores the YAML read for this attempt');
         if (!item.runId) continue;
         const detail = await ui!.evaluate(runId => window.workspace.runDetail({ runId }), item.runId);
         assert.ok(detail.events.some(event => event.type === 'step-started'), 'full history exposes real runner steps');
-        assert.deepEqual(detail.snapshot, batch.snapshot);
+        assert.deepEqual(detail.snapshot, attempt.snapshot);
         assert.equal(detail.result!.definitionHash, item.definitionHash);
         const artifact = detail.result!.artifactDirectory;
         assert.equal(readFileSync(path.join(artifact, 'workflow.yaml'), 'utf8'), expectedDefinitions[index]);
@@ -447,22 +448,42 @@ test('desktop connector batches freeze active runs and reload current workflows 
     await ui.getByRole('button', { name: '重跑失败用例', exact: true }).scrollIntoViewIfNeeded();
     await ui.screenshot({ path: path.join(dir, 'retry-current-scripts.png') });
     await ui.getByRole('button', { name: '重跑失败用例', exact: true }).click();
-    await expect.poll(async () => (await ui!.evaluate(() => window.workspace.state())).batches!.find(batch => batch.sourceBatchId === firstId)?.id).toBeTruthy();
-    const failedRetryId = (await ui.evaluate(() => window.workspace.state())).batches!.find(batch => batch.sourceBatchId === firstId)!.id;
-    const failedRetry = await waitForBatch(failedRetryId);
-    assert.equal(failedRetry.status, 'passed', JSON.stringify(failedRetry));
-    assert.equal(failedRetry.sourceBatchId, firstId); assert.equal(failedRetry.retryMode, 'failed');
-    assert.deepEqual(failedRetry.items.map(item => item.caseId), [refs.cases[1]!.caseId]);
+    await expect.poll(async () => (await ui!.evaluate(() => window.workspace.state())).batches!.find(batch => batch.id === firstId)?.attempts?.length).toBe(2);
+    const failedRetry = await waitForBatch(firstId);
+    assert.equal(failedRetry.status, 'failed', 'the skipped case still prevents an all-green batch');
+    assert.equal(failedRetry.id, firstId); assert.equal(failedRetry.retryMode, 'failed');
+    assert.deepEqual(failedRetry.items.map(item => item.status), ['passed', 'passed', 'skipped']);
+    assert.deepEqual(failedRetry.items[0], firstBatch.items[0], 'passed result and report remain unchanged');
+    assert.deepEqual(failedRetry.attempts!.at(-1)!.items.map(item => item.caseId), [refs.cases[1]!.caseId]);
+    assert.equal(failedRetry.attempts!.at(-1)!.status, 'passed');
     assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'after']);
-    assert.notEqual(failedRetry.items[0]!.definitionHash, firstBatch.items[1]!.definitionHash);
+    assert.notEqual(failedRetry.items[1]!.definitionHash, firstBatch.items[1]!.definitionHash);
     assert.deepEqual(failedRetry.snapshot!.defaults, firstBatch.snapshot!.defaults, 'retry keeps the original run inputs');
     await verifySnapshots(failedRetry, String(input.variables!.knowledgeBaseName), revisedDefinitions, revisedFlow);
     const unfinishedRetry = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'unfinished' as const, sessionId }));
     assert.equal(unfinishedRetry.status, 'passed', JSON.stringify(unfinishedRetry));
-    assert.deepEqual(unfinishedRetry.items.map(item => item.caseId), [refs.cases[2]!.caseId]);
+    assert.equal(unfinishedRetry.id, firstId);
+    assert.deepEqual(unfinishedRetry.items.map(item => item.status), ['passed', 'passed', 'passed']);
+    assert.deepEqual(unfinishedRetry.attempts!.at(-1)!.items.map(item => item.caseId), [refs.cases[2]!.caseId]);
     assert.deepEqual(hits.map(hit => hit.action), ['create', 'delete', 'after', 'create']);
     assert.ok(hits.slice(-2).every(hit => hit.name === input.variables!.knowledgeBaseName + ' revised'), 'retry executes the revised shared flow');
     await verifySnapshots(unfinishedRetry, String(input.variables!.knowledgeBaseName), revisedDefinitions, revisedFlow);
+    await expect(ui.getByTestId('batch-aggregate-summary')).toContainText('已通过 3 / 3 个用例 · 已重跑 2 次');
+    await expect(ui.getByTestId('batch-result-item').locator('[data-status="passed"]')).toHaveCount(3);
+    await expect(ui.getByRole('button', { name: '重跑失败用例', exact: true })).toBeDisabled();
+    await ui.getByLabel('查看运行轮次', { exact: true }).selectOption('0');
+    await expect(ui.getByTestId('batch-attempt-item').nth(1)).toContainText('失败');
+    await ui.screenshot({ path: path.join(dir, 'batch-aggregate-green.png'), fullPage: true });
+    await ui.getByTestId('batch-attempt-item').nth(1).getByRole('button', { name: '查看本次详情' }).click();
+    await expect(ui.getByTestId('run-summary')).toBeVisible();
+    await ui.getByRole('button', { name: '返回批次结果', exact: true }).click();
+    await expect(ui.getByTestId('batch-aggregate-summary')).toContainText('已通过 3 / 3');
+    await ui.getByRole('button', { name: 'Run History', exact: true }).click();
+    await expect(ui.getByTestId('batch-history-row')).toHaveCount(1);
+    await expect(ui.getByTestId('batch-history-row')).toContainText('已重跑 2 次');
+    await expect(ui.getByTestId('batch-history-row').locator('[data-status="passed"]')).toBeVisible();
+    await ui.screenshot({ path: path.join(dir, 'batch-history-green.png') });
+
 
     // A dependent scenario restarts from its first case, even when the user chooses failed only.
     await saveDefinition(1, definitions[1]!);
@@ -480,7 +501,7 @@ test('desktop connector batches freeze active runs and reload current workflows 
       id: dependent.id, mode: 'failed' as const, sessionId, variables: { knowledgeBaseName: retryName },
     }));
     assert.equal(restarted.status, 'passed', JSON.stringify(restarted));
-    assert.equal(restarted.dependent, true); assert.equal(restarted.sourceBatchId, dependent.id);
+    assert.equal(restarted.dependent, true); assert.equal(restarted.id, dependent.id);
     assert.deepEqual(restarted.items.map(item => item.caseId), refs.cases.map(item => item.caseId));
     assert.deepEqual(hits.slice(-3).map(hit => [hit.action, hit.name]), [['create', retryName], ['delete', retryName], ['after', retryName]]);
     await verifySnapshots(restarted, retryName);
@@ -504,7 +525,7 @@ test('desktop connector batches freeze active runs and reload current workflows 
       const hitCount = hits.length;
       await assert.rejects(ui!.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'all' as const, sessionId }), pattern);
       const after = await ui!.evaluate(() => window.workspace.state());
-      assert.equal(after.batches!.length, before.batches!.length);
+      assert.deepEqual(after.batches, before.batches);
       assert.equal(after.runs.length, before.runs.length);
       assert.equal(after.activeBatchId, undefined);
       assert.equal(hits.length, hitCount, 'invalid current scripts cannot start any browser action');
@@ -528,8 +549,11 @@ test('desktop connector batches freeze active runs and reload current workflows 
       await rejectRetry(/共享步骤|共享流程/);
     } finally { writeFileSync(assetsFile, savedAssets); }
     const finalState = await ui.evaluate(() => window.workspace.state());
-    assert.deepEqual(finalState.batches!.find(batch => batch.id === firstId), firstBatch, 'retries leave the original batch unchanged');
-    assert.deepEqual(finalState.batches!.find(batch => batch.id === dependent.id), dependent);
+    assert.equal(finalState.batches!.length, 2, 'only explicitly created batches appear in history');
+    assert.deepEqual(finalState.batches!.find(batch => batch.id === firstId), allRetry);
+    assert.deepEqual(allRetry.attempts![0], firstBatch.attempts![0], 'first attempt stays immutable');
+    assert.deepEqual(allRetry.attempts!.map(attempt => attempt.number), [0, 1, 2, 3]);
+    assert.deepEqual(finalState.batches!.find(batch => batch.id === dependent.id), restarted);
     assert.equal(hits.length, 12); assert.ok(hits.every(hit => hit.who === 'chosen-tab'));
     assert.equal(await other.locator('#result').textContent(), 'Ready', 'another page with the same origin receives no action');
     const history = await ui.evaluate(projectId => window.workspace.history({ projectId, offset: 0, limit: 2 }), refs.projectId);
@@ -539,6 +563,10 @@ test('desktop connector batches freeze active runs and reload current workflows 
     await target.screenshot({ path: path.join(dir, 'chosen-tab-result.png') });
     writeFileSync(path.join(dir, 'observations.json'), JSON.stringify({ hits, batches: completed, totalRuns: history.total,
       selectedTabId: selected.tabId, selectedProfile: catalog.name, otherTabUnchanged: true }, null, 2));
+    await app.close(); app = await electron.launch({ args: [root], env, timeout: 45_000 });
+    ui = await app.firstWindow();
+    const restored = await ui.evaluate(() => window.workspace.state());
+    assert.deepEqual(restored.batches, finalState.batches, 'aggregate results and all attempts survive restart');
     console.log('Batch snapshot integration evidence:', dir);
   } catch (error) {
     writeFileSync(path.join(dir, 'failure-hits.json'), JSON.stringify(hits, null, 2));

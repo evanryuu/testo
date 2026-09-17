@@ -208,11 +208,11 @@ async function startBatch(i: BatchInput, project: Project, groupPlan?: ReturnTyp
     await recorder.release();
     if (quitting) throw new Error('应用正在退出');
     return batchQueue.start({ projectId: i.projectId, environmentId: i.environmentId, environment: plans[0]!.plan.environment.name, failurePolicy: i.failurePolicy, snapshot, dependent: i.dependent,
-      ...(retry ? { sourceBatchId: retry.source.id, retryMode: retry.mode, groups: retry.source.groups } : groupPlan ? { groups: groupPlan.groups } : {}),
+      ...(retry ? { retryMode: retry.mode, groups: retry.source.groups } : groupPlan ? { groups: groupPlan.groups } : {}),
       items: plans.map(({ plan, session }, index) => ({ caseId: plan.item.id, caseName: plan.item.name, workflowId: plan.input.workflowId, sessionName: session.info.name, sessionId: session.info.id,
         definition: plan.sourceText, definitionHash: plan.revision, datasetId: plan.input.datasetId,
         groupNames: retry?.items[index]?.groupNames ?? groupPlan?.groupNames.get(plan.item.id), status: 'queued' })) },
-      (index, batchId) => { const { plan, session } = plans[index]!; return launchRun(plan, session.target, batchId, session.info.name, executionEnvironment); });
+      (index, batchId) => { const { plan, session } = plans[index]!; return launchRun(plan, session.target, batchId, session.info.name, executionEnvironment); }, retry?.source);
   } finally { preparing = false; }
 }
 

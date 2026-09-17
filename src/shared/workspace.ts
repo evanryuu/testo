@@ -42,8 +42,13 @@ export interface BatchRun {
   id: string; projectId: string; environment: string; startedAt: string; finishedAt?: string;
   groups?: { id: string; name: string }[]; environmentId?: string; sourceBatchId?: string; retryMode?: RetryMode; snapshot?: RunSnapshot; dependent?: boolean;
   failurePolicy: 'stop' | 'continue'; status: 'running' | 'passed' | 'failed' | 'cancelled' | 'interrupted';
+  attempts?: BatchAttempt[];
   items: { caseId: string; caseName: string; workflowId: string; sessionName: string; sessionId?: string; datasetId?: string; definition?: string; definitionHash?: string; groupNames?: string[];
     status: 'queued' | 'running' | 'skipped' | 'interrupted' | RunResult['status']; runId?: string; error?: string }[];
+}
+export interface BatchAttempt {
+  number: number; mode?: RetryMode; startedAt: string; finishedAt?: string;
+  status: BatchRun['status']; snapshot?: RunSnapshot; items: BatchRun['items'];
 }
 export interface ProjectAssets { revision: string; variables: Variables; flows: Record<string, { name: string; steps: Record<string, unknown>[] }> }
 export interface RunConfiguration { variables?: Variables; timeoutMs?: number; loginCondition?: string; dependent?: boolean; allowUnverifiedGenerated?: boolean }
