@@ -74,6 +74,11 @@ export function startRun(options: RunOptions, onEvent: (event: WorkerEvent) => v
   let settled = false;
 
   const save = (name: string, data: string) => appendFileSync(path.join(artifactDirectory, name), data, { mode: 0o600 });
+  const diagnostic = (message: string) => {
+    const event: WorkerEvent = { type: 'diagnostic', kind: 'capability', message, at: new Date().toISOString() };
+    save('events.jsonl', `${JSON.stringify({ runId, ...event })}\n`);
+    onEvent(event);
+  };
   child.stdout?.on('data', (chunk: Buffer) => save('stdout.log', chunk.toString()));
   child.stderr?.on('data', (chunk: Buffer) => save('stderr.log', chunk.toString()));
   const send = (message: WorkerCommand) => {
@@ -110,7 +115,7 @@ export function startRun(options: RunOptions, onEvent: (event: WorkerEvent) => v
         finished = message;
         clearTimeout(timeout);
         if (forceTimer) clearTimeout(forceTimer);
-        exitTimer = setTimeout(() => { processError = 'Worker did not exit after cleanup'; killBrowser(); child.kill('SIGKILL'); }, 5000);
+        exitTimer = setTimeout(() => { diagnostic('Worker did not exit after cleanup'); killBrowser(); child.kill('SIGKILL'); }, 5000);
       }
       onEvent(message);
     });
@@ -121,12 +126,15 @@ export function startRun(options: RunOptions, onEvent: (event: WorkerEvent) => v
       if (forceTimer) clearTimeout(forceTimer);
       if (exitTimer) clearTimeout(exitTimer);
       killBrowser();
-      const status = timedOut || processError ? 'error'
-        : cancellationRequested && !finished ? 'cancelled'
-        : code !== 0 || !finished ? 'error'
-        : finished.status;
+      if (finished && processError) diagnostic(processError);
+      const status = timedOut ? 'error'
+        : finished ? finished.status
+        : processError ? 'error'
+        : cancellationRequested ? 'cancelled'
+        : 'error';
       const error = timedOut ? 'Run exceeded its time limit'
-        : processError ?? finished?.error ?? (status === 'error' ? `Worker exited without a valid result (code=${code}, signal=${signal})` : undefined);
+        : finished ? finished.error
+        : processError ?? (status === 'error' ? `Worker exited without a valid result (code=${code}, signal=${signal})` : undefined);
       const summary: RunResult = {
         runId, status, artifactDirectory,
         startedAt: new Date(started).toISOString(), finishedAt: new Date().toISOString(), durationMs: Date.now() - started,
