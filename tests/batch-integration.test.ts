@@ -288,6 +288,10 @@ test('desktop connector batches freeze active runs and reload current workflows 
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert.ok(address && typeof address !== 'string');
   const origin = `http://127.0.0.1:${address.port}`;
+  const adminServer = createServer((request, response) => { server.emit('request', request, response); });
+  await new Promise<void>(resolve => adminServer.listen(0, '127.0.0.1', resolve));
+  const adminAddress = adminServer.address(); assert.ok(adminAddress && typeof adminAddress !== 'string');
+  const adminOrigin = `http://127.0.0.1:${adminAddress.port}`;
   const env = { ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && entry[0] !== 'ELECTRON_RUN_AS_NODE' && !entry[0].startsWith('MIDSCENE_MODEL') && !entry[0].startsWith('OPENAI_'))),
     WORKSPACE_DATA_DIR: path.join(dir, 'app'), WORKSPACE_PROJECTS_DIR: path.join(dir, 'projects') };
   let app: ElectronApplication | undefined, chrome: BrowserContext | undefined, ui: Page | undefined;
@@ -396,6 +400,8 @@ test('desktop connector batches freeze active runs and reload current workflows 
         const artifact = detail.result!.artifactDirectory;
         assert.equal(readFileSync(path.join(artifact, 'workflow.yaml'), 'utf8'), expectedDefinitions[index]);
         const configuration = JSON.parse(readFileSync(path.join(artifact, 'run-configuration.json'), 'utf8'));
+        assert.equal(configuration.baseUrl, attempt.snapshot!.baseUrl);
+        assert.deepEqual(JSON.parse(readFileSync(path.join(artifact, 'configuration.json'), 'utf8')), attempt.snapshot);
         assert.equal(configuration.variables.knowledgeBaseName, expectedName);
         assert.equal(configuration.datasetId, 'smoke');
         const compiled = readFileSync(path.join(artifact, 'compiled-workflow.yaml'), 'utf8');
@@ -548,16 +554,78 @@ test('desktop connector batches freeze active runs and reload current workflows 
       writeFileSync(assetsFile, stringify({ ...parse(savedAssets), flows: {} }));
       await rejectRetry(/共享步骤|共享流程/);
     } finally { writeFileSync(assetsFile, savedAssets); }
+
+    // Correct the environment in the existing batch through the real retry UI.
+    const adminTarget = await chrome.newPage(); await adminTarget.goto(adminOrigin + '/admin');
+    await adminTarget.evaluate(() => sessionStorage.setItem('who', 'admin-tab'));
+    const adminOther = await chrome.newPage(); await adminOther.goto(adminOrigin + '/other');
+    await adminOther.evaluate(() => sessionStorage.setItem('who', 'admin-other-tab'));
+    const adminEnvironmentId = await ui.evaluate(async ({ projectId, baseUrl }) => {
+      await window.workspace.saveEnvironment({ projectId, name: 'Admin', baseUrl, variables: { knowledgeBaseName: 'admin default', site: 'admin' } });
+      return (await window.workspace.state()).projects.find(item => item.id === projectId)!.environments.find(item => item.name === 'Admin')!.id;
+    }, { projectId: refs.projectId, baseUrl: adminOrigin + '/admin' });
+    const beforeEnvironmentRetry = await ui.evaluate(() => window.workspace.state());
+    await assert.rejects(ui.evaluate(input => window.workspace.retryBatch(input), {
+      id: firstId, mode: 'all' as const, environmentId: adminEnvironmentId, sessionId,
+    }), /请重新选择此环境的 Chrome 标签页/);
+    assert.deepEqual((await ui.evaluate(() => window.workspace.state())).batches, beforeEnvironmentRetry.batches);
+    assert.equal(hits.length, 12, 'wrong-environment session is rejected before any browser action');
+    await ui.getByRole('button', { name: 'Run History', exact: true }).click();
+    await ui.getByTestId('batch-history-row').filter({ hasText: '已重跑 3 次' }).click();
+    await expect(ui.getByLabel('重跑环境', { exact: true })).toHaveValue(refs.environmentId);
+    await ui.getByLabel('重跑标签页', { exact: true }).selectOption(sessionId);
+    await ui.getByLabel('重跑环境', { exact: true }).selectOption(adminEnvironmentId);
+    await expect(ui.getByTestId('batch-retry-base-url')).toHaveText(adminOrigin + '/admin');
+    await expect(ui.getByLabel('重跑标签页', { exact: true })).toHaveValue('');
+    await expect(ui.getByRole('button', { name: '重跑整个批次', exact: true })).toBeDisabled();
+    await ui.getByRole('button', { name: `刷新 Profile ${catalog.name}`, exact: true }).click();
+    await ui.getByTestId('chrome-tab').filter({ hasText: adminOrigin + '/admin' }).getByRole('button', { name: '使用此标签页', exact: true }).click();
+    await expect(ui.getByLabel('重跑标签页', { exact: true })).not.toHaveValue('');
+    const adminSessionId = await ui.getByLabel('重跑标签页', { exact: true }).inputValue();
+    assert.ok(adminSessionId); assert.notEqual(adminSessionId, sessionId);
+    const frontResult = await target.locator('#result').textContent();
+    await ui.getByRole('button', { name: '重跑整个批次', exact: true }).click();
+    await expect.poll(async () => (await ui!.evaluate(() => window.workspace.state())).batches!.find(batch => batch.id === firstId)?.attempts?.length).toBe(5);
+    const environmentRetry = await waitForBatch(firstId);
+    assert.equal(environmentRetry.status, 'passed', JSON.stringify(environmentRetry));
+    assert.equal(environmentRetry.environmentId, adminEnvironmentId);
+    assert.equal(environmentRetry.environment, 'Admin');
+    assert.equal(environmentRetry.snapshot!.environmentId, adminEnvironmentId);
+    assert.equal(environmentRetry.snapshot!.baseUrl, adminOrigin + '/admin');
+    assert.deepEqual(environmentRetry.snapshot!.defaults, { knowledgeBaseName: 'admin default', site: 'admin' });
+    for (const key of ['variables', 'model', 'timeoutMs', 'loginCondition'] as const) assert.deepEqual(environmentRetry.snapshot![key], allRetry.snapshot![key]);
+    assert.deepEqual(environmentRetry.attempts!.slice(0, 4), allRetry.attempts, 'changing the environment never rewrites previous attempts');
+    await verifySnapshots(environmentRetry, String(input.variables!.knowledgeBaseName), allDefinitions);
+    assert.ok(hits.slice(-3).every(hit => hit.who === 'admin-tab'));
+    assert.equal(await target.locator('#result').textContent(), frontResult, 'the original environment tab receives no new action');
+    assert.equal(await adminOther.locator('#result').textContent(), 'Ready', 'another tab in the new environment receives no action');
+    await expect(ui.getByTestId('batch-attempt-environment')).toContainText(adminOrigin + '/admin');
+    await ui.getByLabel('查看运行轮次', { exact: true }).selectOption('0');
+    await expect(ui.getByTestId('batch-attempt-environment')).toContainText(origin + '/target');
+    await ui.screenshot({ path: path.join(dir, 'retry-environment-history.png'), fullPage: true });
+    // Omission now defaults to the most recent environment, preserving its frozen settings.
+    const finalRetry = await waitForBatch(await ui.evaluate(input => window.workspace.retryBatch(input), { id: firstId, mode: 'all' as const, sessionId: adminSessionId }));
+    assert.equal(finalRetry.status, 'passed', JSON.stringify(finalRetry));
+    assert.equal(finalRetry.environmentId, adminEnvironmentId);
+    assert.deepEqual(finalRetry.snapshot, environmentRetry.snapshot);
+    assert.deepEqual(finalRetry.attempts!.slice(0, 5), environmentRetry.attempts);
+    await verifySnapshots(finalRetry, String(input.variables!.knowledgeBaseName), allDefinitions);
+    await ui.getByRole('button', { name: 'Run History', exact: true }).click();
+    await ui.getByTestId('batch-history-row').filter({ hasText: 'Admin' }).click();
+    await expect(ui.getByLabel('重跑环境', { exact: true })).toHaveValue(adminEnvironmentId);
+    await expect(ui.getByTestId('batch-retry-base-url')).toHaveText(adminOrigin + '/admin');
+    await ui.screenshot({ path: path.join(dir, 'retry-environment-default.png'), fullPage: true });
     const finalState = await ui.evaluate(() => window.workspace.state());
     assert.equal(finalState.batches!.length, 2, 'only explicitly created batches appear in history');
-    assert.deepEqual(finalState.batches!.find(batch => batch.id === firstId), allRetry);
-    assert.deepEqual(allRetry.attempts![0], firstBatch.attempts![0], 'first attempt stays immutable');
-    assert.deepEqual(allRetry.attempts!.map(attempt => attempt.number), [0, 1, 2, 3]);
+    assert.deepEqual(finalState.batches!.find(batch => batch.id === firstId), finalRetry);
+    assert.deepEqual(finalRetry.attempts![0], firstBatch.attempts![0], 'first attempt stays immutable');
+    assert.deepEqual(finalRetry.attempts!.map(attempt => attempt.number), [0, 1, 2, 3, 4, 5]);
     assert.deepEqual(finalState.batches!.find(batch => batch.id === dependent.id), restarted);
-    assert.equal(hits.length, 12); assert.ok(hits.every(hit => hit.who === 'chosen-tab'));
+    assert.equal(hits.length, 18); assert.ok(hits.slice(0, 12).every(hit => hit.who === 'chosen-tab'));
+    assert.ok(hits.slice(12).every(hit => hit.who === 'admin-tab'));
     assert.equal(await other.locator('#result').textContent(), 'Ready', 'another page with the same origin receives no action');
     const history = await ui.evaluate(projectId => window.workspace.history({ projectId, offset: 0, limit: 2 }), refs.projectId);
-    assert.equal(history.total, 12); assert.equal(history.runs.length, 2);
+    assert.equal(history.total, 18); assert.equal(history.runs.length, 2);
     assert.ok(history.runs.every(run => run.events.length === 0), 'history lists stay light; full events are fetched on demand');
     assert.deepEqual(uiErrors, []);
     await target.screenshot({ path: path.join(dir, 'chosen-tab-result.png') });
@@ -576,7 +644,8 @@ test('desktop connector batches freeze active runs and reload current workflows 
     }
     throw error;
   } finally {
-    await app?.close(); await chrome?.close(); server.closeAllConnections();
+    await app?.close(); await chrome?.close(); server.closeAllConnections(); adminServer.closeAllConnections();
+    await new Promise<void>(resolve => adminServer.close(() => resolve()));
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

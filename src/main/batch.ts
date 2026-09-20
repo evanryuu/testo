@@ -26,6 +26,8 @@ export class BatchQueue {
       snapshot: structuredClone(input.snapshot), items: structuredClone(input.items) };
     indexes.forEach((index, position) => { batch.items[index] = attempt.items[position]!; });
     batch.snapshot = structuredClone(input.snapshot);
+    batch.environmentId = input.environmentId;
+    batch.environment = input.environment;
     batch.retryMode = input.retryMode;
     batch.status = 'running'; batch.finishedAt = undefined;
     batch.attempts = [...attempts, attempt];

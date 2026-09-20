@@ -185,7 +185,15 @@ async function startBatch(i: BatchInput, project: Project, groupPlan?: ReturnTyp
   if (i.failurePolicy !== 'stop' && i.failurePolicy !== 'continue') throw new Error('请选择失败处理方式');
   const snapshot = retry?.source.snapshot ? { ...structuredClone(retry.source.snapshot), variables: validateVariables(i.variables ?? retry.source.snapshot.variables) } : configurationSnapshot(project, i.environmentId, i);
   if (retry) {
-    // Retry current scripts with the original run settings, then freeze this attempt.
+    // A different environment replaces only environment settings; other retry settings stay fixed.
+    if (i.environmentId !== snapshot.environmentId) {
+      const environment = project.environments.find(item => item.id === i.environmentId);
+      if (!environment) throw new Error('请选择运行环境');
+      snapshot.environmentId = environment.id;
+      snapshot.baseUrl = environment.web.baseUrl;
+      snapshot.defaults = { ...project.assets?.variables, ...environment.variables };
+    }
+    // Retry current scripts, then freeze this attempt.
     snapshot.flows = structuredClone(project.assets?.flows ?? {});
     const git = gitInfo(project.root, false);
     snapshot.git = { branch: git.branch, commit: git.commit, dirty: !!git.status };
@@ -273,7 +281,7 @@ const handlers: Record<string, (input: any) => unknown> = {
     const source = history.batch(i.id); if (!source) throw new Error('原批次不存在');
     if (!source.snapshot || !source.environmentId) throw new Error('旧批次没有完整配置快照，请配置新批次');
     const items = retryItems(source, i.mode), project = store.project(source.projectId);
-    return startBatch({ projectId: source.projectId, environmentId: source.environmentId, failurePolicy: source.failurePolicy, dependent: source.dependent, allowUnverifiedGenerated: i.allowUnverifiedGenerated, variables: i.variables ?? source.snapshot.variables,
+    return startBatch({ projectId: source.projectId, environmentId: i.environmentId ?? source.environmentId, failurePolicy: source.failurePolicy, dependent: source.dependent, allowUnverifiedGenerated: i.allowUnverifiedGenerated, variables: i.variables ?? source.snapshot.variables,
       items: items.map(item => ({ caseId: item.caseId, workflowId: item.workflowId, datasetId: item.datasetId, sessionId: i.sessionId })) }, project, undefined, { source, mode: i.mode, items });
   },
   createProject: (i) => store.create(i.name, i.description ?? ''),

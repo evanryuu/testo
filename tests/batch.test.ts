@@ -128,6 +128,29 @@ test('passing failed items does not hide unfinished items; completing them makes
   }
 });
 
+test('changing retry environment updates batch defaults and preserves every previous attempt', async () => {
+  const store = new HistoryStore(':memory:');
+  const queue = new BatchQueue(batch => store.saveBatch(batch));
+  const snapshot = { environmentId: 'frontend', baseUrl: 'https://front.example', variables: {}, defaults: { site: 'front' }, model: { name: '', baseUrl: '', family: '' } };
+  const id = queue.start({ ...input('continue'), environmentId: 'frontend', snapshot }, index => ({ runId: `initial-${index}`, result: Promise.resolve(result(index === 0 ? 'passed' : 'failed')), cancel() {} }));
+  await queue.result;
+  const source = store.batch(id)!;
+  const nextSnapshot = { ...snapshot, environmentId: 'admin', baseUrl: 'https://admin.example', defaults: { site: 'admin' } };
+  queue.start({ ...source, environmentId: 'admin', environment: 'Admin', snapshot: nextSnapshot, retryMode: 'failed',
+    items: retryItems(source, 'failed').map(item => ({ ...item, status: 'queued', runId: undefined })) },
+    index => ({ runId: `retry-${index}`, result: Promise.resolve(result()), cancel() {} }), source);
+  await queue.result;
+  const saved = store.batch(id)!;
+  assert.equal(saved.environmentId, 'admin');
+  assert.equal(saved.environment, 'Admin');
+  assert.deepEqual(saved.snapshot, nextSnapshot);
+  assert.deepEqual(saved.attempts![0], source.attempts![0]);
+  assert.deepEqual(saved.attempts![1]!.snapshot, nextSnapshot);
+  assert.deepEqual(saved.items[0], source.items[0], 'passed result retains its original run and environment evidence');
+  assert.deepEqual(source.snapshot, snapshot, 'source history stays unchanged');
+  store.close();
+});
+
 test('legacy batches gain attempt history and an all-items retry replaces old passed results', async () => {
   const source: BatchRun = { ...input('continue'), id: 'legacy', startedAt: '2026-09-01T00:00:00Z', status: 'passed',
     items: input().items.map((item, index) => ({ ...item, status: 'passed', runId: `old-${index}` })) };

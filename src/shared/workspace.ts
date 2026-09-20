@@ -55,7 +55,7 @@ export interface RunConfiguration { variables?: Variables; timeoutMs?: number; l
 export type RetryMode = 'failed' | 'unfinished' | 'all';
 export interface RunSnapshot { environmentId: string; baseUrl: string; variables: Variables; defaults?: Variables; flows?: ProjectAssets['flows']; model: { name: string; baseUrl: string; family: string }; git?: { commit?: string; branch?: string; dirty: boolean }; timeoutMs?: number; loginCondition?: string }
 export interface RunInput extends RunConfiguration { projectId: string; caseId: string; workflowId: string; environmentId: string; browserMode?: 'isolated' | 'bridge'; sessionId?: string; datasetId?: string; debug?: DebugSelection }
-export interface RetryBatchInput { allowUnverifiedGenerated?: boolean; id: string; mode: RetryMode; sessionId: string; variables?: Variables }
+export interface RetryBatchInput { allowUnverifiedGenerated?: boolean; id: string; mode: RetryMode; sessionId: string; environmentId?: string; variables?: Variables }
 export interface PreflightResult { ready: boolean; checks: { name: string; status: 'passed' | 'failed' | 'info'; message: string }[]; variables: Variables; steps: number }
 export interface HistoryQuery { projectId?: string; caseId?: string; status?: string; environment?: string; after?: string; before?: string; offset?: number; limit?: number }
 export interface HistoryPage { runs: HistoryRun[]; total: number }
